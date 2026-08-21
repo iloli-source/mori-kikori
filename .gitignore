@@ -1,0 +1,7 @@
+.venv/
+tokens.json
+tokens.json.tmp
+data/
+logs/
+__pycache__/
+.DS_Store
