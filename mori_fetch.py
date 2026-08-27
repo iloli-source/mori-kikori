@@ -356,11 +356,14 @@ def transcript_to_text(transcript: dict | list, title: str = "") -> str:
         utterances = transcript.get("utterances") or []
     else:
         utterances = transcript
+    if not isinstance(utterances, list):
+        raise RuntimeError(f"transcript.utterances is not a list: {type(utterances).__name__}")
 
     lines: list[str] = []
     for u in utterances:
         if not isinstance(u, dict):
-            continue
+            # 非 dict を黙って捨てると発話欠落が「本文なし成功」に化ける
+            raise RuntimeError(f"transcript contains non-dict utterance: {u!r}")
         text = (u.get("text") or "").strip()
         if not text:
             continue
@@ -388,7 +391,10 @@ async def list_sessions_for_date(client: MoriClient, target_day: date) -> list[d
     to_str = (target_day + timedelta(days=1)).isoformat()
     sessions: list[dict] = []
     offset = 0
+    max_offset = LIST_PAGE_SIZE * 100  # サーバーが offset を無視した場合の無限ループ防止
     while True:
+        if offset >= max_offset:
+            raise RuntimeError(f"list_sessions pagination exceeded {max_offset} items — server ignoring offset?")
         data = await client.call_tool_json(
             "list_sessions",
             {"from": from_str, "to": to_str, "limit": LIST_PAGE_SIZE, "offset": offset},
