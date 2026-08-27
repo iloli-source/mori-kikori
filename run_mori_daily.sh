@@ -22,7 +22,7 @@ mkdir -p "$LOG_DIR"
 # PID の生存だけでなくコマンド名も確認し、PID 再利用で永久スキップに陥らないようにする。
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   OTHER_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-  if [ -n "$OTHER_PID" ] && ps -o command= -p "$OTHER_PID" 2>/dev/null | grep -q 'run_mori_daily'; then
+  if [ -n "$OTHER_PID" ] && ps -o command= -p "$OTHER_PID" 2>/dev/null | grep -q 'run_mori_daily\.sh'; then
     echo "$(date '+%F %T') another run in progress (pid=$OTHER_PID), skip" >> "$LOG_FILE"
     exit 0
   fi
@@ -39,7 +39,8 @@ if [ "$(cat "$PID_FILE" 2>/dev/null)" != "$$" ]; then
   echo "$(date '+%F %T') lock lost to concurrent reclaim, skip" >> "$LOG_FILE"
   exit 0
 fi
-trap 'rm -rf "$LOCK_DIR"' EXIT
+# 所有者(自分のPIDが記録されている)場合のみロックを片付ける — 競合側のロックを消さない
+trap '[ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK_DIR"' EXIT
 
 {
   echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (backfill --refetch-recent 8) ==="

@@ -46,8 +46,12 @@ class TestTranscriptToText:
         transcript = {"utterances": [{"text": "  "}, {"text": "メモ"}]}
         assert transcript_to_text(transcript) == "[--:--:--] メモ"
 
-    def test_empty_transcript_returns_empty(self):
-        assert transcript_to_text({}) == ""
+    def test_transcript_without_utterances_is_error(self):
+        # utterances キーの無い dict は「発話ゼロ」ではなく形状エラー
+        import pytest as _pytest
+
+        with _pytest.raises(RuntimeError):
+            transcript_to_text({})
 
 
 class TestSessionDate:
@@ -116,3 +120,32 @@ class TestTitleOnlyTranscript:
     def test_title_prepended_when_utterances_exist(self):
         transcript = {"utterances": [{"started_at": "2026-08-21T09:00:00+09:00", "text": "あ"}]}
         assert transcript_to_text(transcript, title="T") == "# T\n[09:00:00] あ"
+
+
+class TestStrictUtteranceShapes:
+    def test_missing_utterances_key_is_error(self):
+        import pytest as _pytest
+
+        with _pytest.raises(RuntimeError):
+            transcript_to_text({"title": "T"})
+
+    def test_null_utterances_is_error(self):
+        import pytest as _pytest
+
+        with _pytest.raises(RuntimeError):
+            transcript_to_text({"utterances": None})
+
+    def test_non_list_utterances_is_error(self):
+        import pytest as _pytest
+
+        with _pytest.raises(RuntimeError):
+            transcript_to_text({"utterances": {}})
+
+    def test_non_dict_utterance_entry_is_error(self):
+        import pytest as _pytest
+
+        with _pytest.raises(RuntimeError):
+            transcript_to_text({"utterances": [None]})
+
+    def test_empty_list_is_legitimate_empty(self):
+        assert transcript_to_text({"utterances": []}) == ""

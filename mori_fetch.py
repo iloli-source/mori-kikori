@@ -353,7 +353,11 @@ def transcript_to_text(transcript: dict | list, title: str = "") -> str:
     「本文あり」と判定されると、発話ゼロの日が保存確定してしまうため。
     """
     if isinstance(transcript, dict):
-        utterances = transcript.get("utterances") or []
+        if "utterances" not in transcript or transcript["utterances"] is None:
+            # キー欠落や null を「発話ゼロ」に型強制すると、空マーク確定で
+            # 再取得窓外のデータを永久に取り逃す。正当な空は [] のみ
+            raise RuntimeError("transcript has no utterances list")
+        utterances = transcript["utterances"]
     else:
         utterances = transcript
     if not isinstance(utterances, list):
