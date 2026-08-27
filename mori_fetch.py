@@ -88,7 +88,9 @@ async def _discover_token_endpoint(client: httpx2.AsyncClient) -> str:
         if resp.status_code == 200:
             endpoint = resp.json().get("token_endpoint")
             if isinstance(endpoint, str) and endpoint.startswith("https://"):
-                return endpoint
+                # リフレッシュトークンを送る先は MCP サーバーと同一ホストに限定する
+                if urllib.parse.urlparse(endpoint).netloc == urllib.parse.urlparse(MCP_URL).netloc:
+                    return endpoint
     except (httpx2.HTTPError, ValueError):
         pass
     return TOKEN_ENDPOINT
@@ -394,8 +396,9 @@ async def list_sessions_for_date(client: MoriClient, target_day: date) -> list[d
         if not isinstance(data, dict) or "sessions" not in data:
             # "sessions" キー欠落を0件成功と誤認すると空マークでデータを永久喪失する
             raise RuntimeError(f"list_sessions returned unexpected shape: {str(data)[:200]}")
-        page = data["sessions"] or []
+        page = data["sessions"]
         if not isinstance(page, list):
+            # {} や null を「0件」に型強制しない — 空マーク確定はリスト型の [] のみ
             raise RuntimeError(f"list_sessions.sessions is not a list: {type(page).__name__}")
         sessions.extend(s for s in page if isinstance(s, dict))
         if len(page) < LIST_PAGE_SIZE:
@@ -475,10 +478,9 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
             texts: list[str] = []
             for i, session in enumerate(sessions):
                 if not session.get("id"):
-                    # id が無いセッションは取得手段がない。失敗扱いにすると
-                    # その日が永久にリトライされ続けるため、警告して飛ばす
-                    print(f"  → 警告: id のないセッションをスキップ: {session.get('title')!r}", file=sys.stderr)
-                    continue
+                    # id が無ければ取得不能。スキップして成功扱いにすると
+                    # 取れなかったデータを「処理済み」として隠蔽するため失敗にする
+                    raise RuntimeError(f"session without id: {session.get('title')!r}")
                 title = session.get("title") or ""
                 transcript = await fetch_transcript(client, session)
                 text = transcript_to_text(transcript, title=title)
@@ -486,6 +488,33 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
                     texts.append(text)
                 if i < len(sessions) - 1:
                     await asyncio.sleep(TRANSCRIPT_FETCH_INTERVAL_SEC)
+
+            # 書き込みはコンテキスト内で行う。__aexit__ の失敗(cancel scope 等)で
+            # 取得済みの本文を捨てないため
+            result = "\n\n---\n\n".join(texts)
+            if not result.strip():
+                # ここに到達した時点で全 fetch は成功している。
+                # 全セッションが正当に本文空だった日として、スキップマークを作る。
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    print(f"  → {target_day}: サーバーは本文なしだが既存データがあるため保持します。", file=sys.stderr)
+                    return 0
+                print(f"  → {target_day}: セッション {len(sessions)} 件、いずれも本文なし。空マークを作成します。")
+                _atomic_write(out_path, "")
+                return 2
+
+            # 再取得で内容が既存より縮む場合は上書きしない（文字起こしは追記される
+            # 一方で、部分的な取得成功が既存の完全なデータを縮小させる事故を防ぐ）
+            new_size = len(result.encode("utf-8"))
+            if os.path.exists(out_path) and os.path.getsize(out_path) > new_size:
+                print(
+                    f"  → {target_day}: 新規取得 {new_size}B が既存 {os.path.getsize(out_path)}B より小さいため保持します。",
+                    file=sys.stderr,
+                )
+                return 0
+
+            _atomic_write(out_path, result)
+            print(f"  → 保存しました: {out_path}")
+            return 0
     except AuthRequiredError as e:
         print(f"  → 認証エラー: {e}", file=sys.stderr)
         return 1
@@ -496,24 +525,35 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
         else:
             print(f"  → API error for {target_day}: {eg!r}", file=sys.stderr)
         return 1
+    except OSError as e:
+        # ディスクフル・権限等の書き込み障害
+        print(f"  → 書き込みエラー for {target_day}: {e}", file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"  → API error for {target_day}: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
-    result = "\n\n---\n\n".join(texts)
-    if not result.strip():
-        # ここに到達した時点で全 fetch は成功している（例外は上で rc=1 になる）。
-        # 全セッションが正当に本文空だった日として、スキップマークを作る。
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            print(f"  → {target_day}: サーバーは本文なしだが既存データがあるため保持します。", file=sys.stderr)
-            return 0
-        print(f"  → {target_day}: セッション {len(sessions)} 件、いずれも本文なし。空マークを作成します。")
-        _atomic_write(out_path, "")
-        return 2
 
-    _atomic_write(out_path, result)
-    print(f"  → 保存しました: {out_path}")
-    return 0
+TRANSIENT_RETRY_WAIT_SEC = 15
+
+
+async def download_with_retry(target_day: date, data_dir: str, retries: int = 2, wait_sec: float | None = None) -> int:
+    """download_single_date を一時障害時にバックオフ付きで再試行するラッパー。
+
+    実運用でサーバー切断(ReadError/ConnectError 等)が散発することが確認されて
+    おり、多くは時間を置いたリトライで成功する。失敗が残っても翌日の
+    バックフィルで自動再試行されるため、 here での再試行は控えめでよい。
+    """
+    wait = TRANSIENT_RETRY_WAIT_SEC if wait_sec is None else wait_sec
+    rc = await download_single_date(target_day, data_dir)
+    attempts = 0
+    while rc == 1 and attempts < retries:
+        attempts += 1
+        print(f"  → {target_day}: {wait}秒後に再試行します ({attempts}/{retries})")
+        await asyncio.sleep(wait)
+        rc = await download_single_date(target_day, data_dir)
+        wait *= 3  # バックオフ: 15秒 → 45秒
+    return rc
 
 
 def find_missing_dates(data_dir: str, start_date: date, end_date: date) -> list[date]:
@@ -604,7 +644,7 @@ def main() -> None:
             print("エラー: 日付は YYYY-MM-DD 形式で指定してください。", file=sys.stderr)
             sys.exit(1)
         _refresh_or_exit()
-        sys.exit(asyncio.run(download_single_date(target, DATA_DIR)))
+        sys.exit(asyncio.run(download_with_retry(target, DATA_DIR)))
 
     if args.days_ago is not None:
         if args.days_ago < 0:
@@ -612,7 +652,7 @@ def main() -> None:
             sys.exit(1)
         target = today - timedelta(days=args.days_ago)
         _refresh_or_exit()
-        sys.exit(asyncio.run(download_single_date(target, DATA_DIR)))
+        sys.exit(asyncio.run(download_with_retry(target, DATA_DIR)))
 
     # デフォルト: 未取得日の自動バックフィル（当日は対象外 — 記録が確定していないため）
     try:
@@ -641,7 +681,7 @@ def main() -> None:
     failed: list[date] = []
     for i, target in enumerate(targets, 1):
         print(f"\n[{i}/{len(targets)}] {target} を処理中...")
-        rc = asyncio.run(download_single_date(target, DATA_DIR))
+        rc = asyncio.run(download_with_retry(target, DATA_DIR))
         if rc == 1:
             failed.append(target)
         if i < len(targets):

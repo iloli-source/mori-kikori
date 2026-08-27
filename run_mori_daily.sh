@@ -1,7 +1,7 @@
 #!/bin/bash
 # 毎日0時5分(JST)にcronから実行する。
 # バックフィルモードで動くため、過去に失敗した日も自動で再試行され、
-# 直近3日は文字起こし遅延の取り込みのため取得済みでも再取得する。
+# 直近7日は文字起こし遅延(最大7日)の取り込みのため取得済みでも再取得する。
 
 set -u
 
@@ -17,14 +17,15 @@ PID_FILE="$LOCK_DIR/pid"
 
 mkdir -p "$LOG_DIR"
 
-# 二重起動防止（mkdir はアトミック）。先行プロセスが死んでいる場合のみロックを引き継ぐ。
+# 二重起動防止（mkdir はアトミック）。先行プロセスが生きている場合のみスキップする。
+# PID の生存だけでなくコマンド名も確認し、PID 再利用で永久スキップに陥らないようにする。
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   OTHER_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-  if [ -n "$OTHER_PID" ] && kill -0 "$OTHER_PID" 2>/dev/null; then
+  if [ -n "$OTHER_PID" ] && ps -o command= -p "$OTHER_PID" 2>/dev/null | grep -q 'run_mori_daily'; then
     echo "$(date '+%F %T') another run in progress (pid=$OTHER_PID), skip" >> "$LOG_FILE"
     exit 0
   fi
-  # 残骸ロック（プロセス消滅済み）を回収
+  # 残骸ロック（プロセス消滅 or 無関係プロセスの PID）を回収
   rm -rf "$LOCK_DIR"
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     echo "$(date '+%F %T') lock busy, skip" >> "$LOG_FILE"
@@ -32,11 +33,16 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   fi
 fi
 echo $$ > "$PID_FILE"
+# 残骸回収の同時競合(TOCTOU)対策: 書いた直後に自分の PID が残っているか再確認
+if [ "$(cat "$PID_FILE" 2>/dev/null)" != "$$" ]; then
+  echo "$(date '+%F %T') lock lost to concurrent reclaim, skip" >> "$LOG_FILE"
+  exit 0
+fi
 trap 'rm -rf "$LOCK_DIR"' EXIT
 
 {
-  echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (backfill --refetch-recent 3) ==="
-  "$PYTHON_BIN" "$PY_SCRIPT" --refetch-recent 3
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (backfill --refetch-recent 7) ==="
+  "$PYTHON_BIN" "$PY_SCRIPT" --refetch-recent 7
   EXIT_CODE=$?
   echo "=== $(date '+%Y-%m-%d %H:%M:%S') END (exit=$EXIT_CODE) ==="
   echo ""

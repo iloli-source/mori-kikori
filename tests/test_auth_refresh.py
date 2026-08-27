@@ -126,3 +126,14 @@ class TestAtomicWrite:
         assert target.read_text(encoding="utf-8") == "こんにちは"
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
         assert list(tmp_path.glob("*.tmp*")) == []
+
+
+class TestSchemaInvalidTokens:
+    def test_schema_invalid_tokens_are_quarantined(self, tmp_path):
+        path = tmp_path / "tokens.json"
+        path.write_text(json.dumps({"tokens": "not-an-object"}), encoding="utf-8")
+
+        result = asyncio.run(FileTokenStorage(str(path)).get_tokens())
+
+        assert result is None
+        assert (tmp_path / "tokens.json.corrupt").exists()

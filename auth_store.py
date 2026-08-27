@@ -9,6 +9,8 @@ import json
 import os
 import time
 
+from pydantic import ValidationError
+
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 TOKENS_FILE = os.path.join(os.path.dirname(__file__), "tokens.json")
@@ -26,21 +28,33 @@ class FileTokenStorage:
         try:
             with open(self.path, encoding="utf-8") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, OSError):
-            # 壊れたファイルは無言で {} にせず、診断用に退避してから空扱いにする
+        except json.JSONDecodeError:
+            # 中身が壊れている場合のみ診断用に退避して空扱いにする。
+            # 一時的な I/O 障害(OSError)は上に伝播させ、有効なトークンを動かさない
             try:
                 os.replace(self.path, f"{self.path}.corrupt")
             except OSError:
                 pass
             return {}
 
+    def _quarantine(self) -> None:
+        """スキーマ不正なファイルを診断用に退避する。"""
+        try:
+            os.replace(self.path, f"{self.path}.corrupt")
+        except OSError:
+            pass
+
     def _save(self, data: dict) -> None:
         tmp_path = f"{self.path}.tmp{os.getpid()}"
-        # 作成時点から 0600（chmod 前の一瞬でも他ユーザーに読ませない）
-        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, self.path)
+        try:
+            # 作成時点から 0600（chmod 前の一瞬でも他ユーザーに読ませない）
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     async def get_tokens(self) -> OAuthToken | None:
         """保存済みトークンを返す。expires_in は取得時刻からの残り秒数に補正する。
@@ -51,7 +65,11 @@ class FileTokenStorage:
         data = self._load()
         if "tokens" not in data:
             return None
-        tokens = OAuthToken.model_validate(data["tokens"])
+        try:
+            tokens = OAuthToken.model_validate(data["tokens"])
+        except ValidationError:
+            self._quarantine()
+            return None
         obtained_at = data.get("obtained_at")
         if obtained_at is not None and tokens.expires_in is not None:
             remaining = int(obtained_at + tokens.expires_in - time.time())
@@ -68,7 +86,11 @@ class FileTokenStorage:
         data = self._load()
         if "client_info" not in data:
             return None
-        return OAuthClientInformationFull.model_validate(data["client_info"])
+        try:
+            return OAuthClientInformationFull.model_validate(data["client_info"])
+        except ValidationError:
+            self._quarantine()
+            return None
 
     async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
         data = self._load()
