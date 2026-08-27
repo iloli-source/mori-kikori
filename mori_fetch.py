@@ -14,11 +14,11 @@ mcp SDK はトークン有効期限をプロセス内にしか保持せず、再
     python mori_fetch.py                  # 未取得日を自動バックフィル
 
 終了コード（limitless_fetch.py と同じ規約）:
-    0 = データあり保存成功 / 1 = API・認証エラー / 2 = セッションなし（空ファイルでスキップマーク）
+    0 = データあり保存成功 / 1 = API・認証エラー / 2 = データなし（空ファイルでスキップマーク）
 
-※ 空ファイルのスキップマークは「list_sessions が成功し 0 件」の場合のみ作る。
-   通信エラーやセッションはあるのに本文が取れない異常はファイルを作らず 1 で
-   終了し、次回バックフィルで再試行される。
+※ 空ファイルのスキップマークは「全取得が成功してデータが無かった」場合のみ作る
+   （セッション0件、または全セッションの本文が正当に空）。通信エラー等の異常は
+   ファイルを作らず 1 で終了し、次回バックフィルで再試行される。
 """
 
 import argparse
@@ -72,14 +72,42 @@ class AuthRequiredError(Exception):
     """保存済みトークンが無効で、ブラウザ再認証が必要な状態。"""
 
 
-async def ensure_fresh_token() -> None:
+_last_refresh_monotonic: float | None = None
+
+# アクセストークンは1時間有効。長時間実行ではこの間隔で再リフレッシュする
+REFRESH_MARGIN_SEC = 40 * 60
+
+
+async def _discover_token_endpoint(client: httpx2.AsyncClient) -> str:
+    """OAuth サーバーメタデータからトークンエンドポイントを検出する。
+
+    取得できない場合は既知の URL にフォールバックする。
+    """
+    try:
+        resp = await client.get(f"{MCP_URL}/.well-known/oauth-authorization-server")
+        if resp.status_code == 200:
+            endpoint = resp.json().get("token_endpoint")
+            if isinstance(endpoint, str) and endpoint.startswith("https://"):
+                return endpoint
+    except (httpx2.HTTPError, ValueError):
+        pass
+    return TOKEN_ENDPOINT
+
+
+async def ensure_fresh_token(
+    storage: FileTokenStorage | None = None,
+    transport: "httpx2.AsyncBaseTransport | None" = None,
+) -> None:
     """保存済みリフレッシュトークンでアクセストークンを更新して保存する。
 
     毎回の実行冒頭で呼ぶ。mcp SDK は保存トークンの有効期限を復元しないため、
     ここで必ず新しいアクセストークン（1時間有効）に差し替えてから接続する。
     リフレッシュトークンも更新されるたびに30日延命される。
+
+    storage / transport はテスト用の注入ポイント（本番は既定値でよい）。
     """
-    storage = FileTokenStorage()
+    global _last_refresh_monotonic
+    storage = storage or FileTokenStorage()
     tokens = await storage.get_tokens()
     client_info = await storage.get_client_info()
     if not tokens or not tokens.refresh_token or not client_info:
@@ -92,19 +120,31 @@ async def ensure_fresh_token() -> None:
         "resource": MCP_URL,
     }
     try:
-        async with httpx2.AsyncClient(timeout=30) as client:
-            resp = await client.post(TOKEN_ENDPOINT, data=data)
+        async with httpx2.AsyncClient(timeout=30, transport=transport) as client:
+            endpoint = await _discover_token_endpoint(client)
+            resp = await client.post(endpoint, data=data)
     except httpx2.HTTPError as e:
         raise RuntimeError(f"トークンエンドポイントに接続できません: {e}") from e
 
+    if resp.status_code in (400, 401):
+        # invalid_grant 等 — リフレッシュトークン自体が無効
+        raise AuthRequiredError(f"トークン更新拒否 (HTTP {resp.status_code}): {resp.text[:200]} — {LOGIN_HINT}")
     if resp.status_code != 200:
-        raise AuthRequiredError(f"トークン更新失敗 (HTTP {resp.status_code}): {resp.text[:200]} — {LOGIN_HINT}")
+        # 5xx 等の一時障害は認証失効ではない
+        raise RuntimeError(f"トークンエンドポイント一時障害 (HTTP {resp.status_code}): {resp.text[:200]}")
 
     new_tokens = OAuthToken.model_validate(resp.json())
     if not new_tokens.refresh_token:
         # ローテーションされない実装への保険: 既存のリフレッシュトークンを維持
         new_tokens = new_tokens.model_copy(update={"refresh_token": tokens.refresh_token})
     await storage.set_tokens(new_tokens)
+    _last_refresh_monotonic = time.monotonic()
+
+
+async def refresh_if_stale() -> None:
+    """アクセストークンの残り寿命が心許なければ再リフレッシュする（長時間実行用）。"""
+    if _last_refresh_monotonic is None or time.monotonic() - _last_refresh_monotonic > REFRESH_MARGIN_SEC:
+        await ensure_fresh_token()
 
 
 def _run_callback_server() -> AuthorizationCodeResult:
@@ -305,16 +345,17 @@ def _session_date(session: dict) -> date | None:
 
 
 def transcript_to_text(transcript: dict | list, title: str = "") -> str:
-    """Transcript を「[HH:MM:SS] 話者: テキスト」形式に整形する。"""
-    lines: list[str] = []
-    if title:
-        lines.append(f"# {title}")
+    """Transcript を「[HH:MM:SS] 話者: テキスト」形式に整形する。
 
+    発話が1件もなければタイトルがあっても空文字を返す。タイトル行だけで
+    「本文あり」と判定されると、発話ゼロの日が保存確定してしまうため。
+    """
     if isinstance(transcript, dict):
         utterances = transcript.get("utterances") or []
     else:
         utterances = transcript
 
+    lines: list[str] = []
     for u in utterances:
         if not isinstance(u, dict):
             continue
@@ -325,6 +366,11 @@ def transcript_to_text(transcript: dict | list, title: str = "") -> str:
         speaker = u.get("speaker_name") or u.get("speaker") or ""
         prefix = f"{speaker}: " if speaker else ""
         lines.append(f"[{ts}] {prefix}{text}")
+
+    if not lines:
+        return ""
+    if title:
+        lines.insert(0, f"# {title}")
     return "\n".join(lines)
 
 
@@ -345,9 +391,12 @@ async def list_sessions_for_date(client: MoriClient, target_day: date) -> list[d
             "list_sessions",
             {"from": from_str, "to": to_str, "limit": LIST_PAGE_SIZE, "offset": offset},
         )
-        if not isinstance(data, dict):
-            raise RuntimeError(f"list_sessions returned unexpected shape: {type(data).__name__}")
-        page = data.get("sessions") or []
+        if not isinstance(data, dict) or "sessions" not in data:
+            # "sessions" キー欠落を0件成功と誤認すると空マークでデータを永久喪失する
+            raise RuntimeError(f"list_sessions returned unexpected shape: {str(data)[:200]}")
+        page = data["sessions"] or []
+        if not isinstance(page, list):
+            raise RuntimeError(f"list_sessions.sessions is not a list: {type(page).__name__}")
         sessions.extend(s for s in page if isinstance(s, dict))
         if len(page) < LIST_PAGE_SIZE:
             break
@@ -355,7 +404,9 @@ async def list_sessions_for_date(client: MoriClient, target_day: date) -> list[d
         await asyncio.sleep(LIST_PAGE_INTERVAL_SEC)
 
     selected = [s for s in sessions if _session_date(s) in (target_day, None)]
-    selected.sort(key=lambda s: s.get("started_at") or "")
+    # ISO文字列の辞書順はオフセット混在(+09:00とZ等)で狂うため、パース済み時刻で並べる
+    epoch = datetime.fromtimestamp(0, tz=timezone.utc)
+    selected.sort(key=lambda s: _parse_iso(s.get("started_at")) or epoch)
     return selected
 
 
@@ -381,12 +432,20 @@ async def fetch_transcript(client: MoriClient, session: dict) -> dict:
 
 
 def _atomic_write(path: str, content: str) -> None:
-    """一時ファイル経由で書き込み、途中クラッシュでも壊れたファイルを残さない。"""
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(content)
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, path)
+    """一時ファイル経由で書き込み、途中クラッシュでも壊れたファイルを残さない。
+
+    tmp 名に PID を含め、手動実行と cron の同時書き込みでも衝突しない。
+    """
+    tmp_path = f"{path}.tmp{os.getpid()}"
+    try:
+        # 作成時点から 0600（chmod 前の一瞬でも他ユーザーに読ませない）
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 async def download_single_date(target_day: date, data_dir: str) -> int:
@@ -394,21 +453,32 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
 
     Returns:
         0 = データあり保存成功
-        1 = API・認証エラー、またはセッションはあるが本文が空（ファイル変更なし・次回再試行）
-        2 = list_sessions 成功でセッション0件（空ファイルでスキップマーク）
+        1 = API・認証エラー（ファイル変更なし・次回再試行）
+        2 = 全取得が成功しデータなし — セッション0件または全セッション本文空（空ファイルでスキップマーク）
     """
     out_path = os.path.join(data_dir, f"{FILE_PREFIX}{target_day.isoformat()}.txt")
     print(f"Fetching mori sessions for {target_day} (Asia/Tokyo) ...")
 
     try:
+        # 長時間バックフィルでもアクセストークン(1時間有効)が切れないよう随時更新
+        await refresh_if_stale()
         async with MoriClient(interactive=False) as client:
             sessions = await list_sessions_for_date(client, target_day)
             if not sessions:
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    # 再取得で0件になっても、既存の実データを空マークで潰さない
+                    print(f"  → {target_day}: サーバーは0件だが既存データがあるため保持します。", file=sys.stderr)
+                    return 0
                 print(f"  → {target_day}: セッションはありませんでした。")
                 _atomic_write(out_path, "")
                 return 2
             texts: list[str] = []
             for i, session in enumerate(sessions):
+                if not session.get("id"):
+                    # id が無いセッションは取得手段がない。失敗扱いにすると
+                    # その日が永久にリトライされ続けるため、警告して飛ばす
+                    print(f"  → 警告: id のないセッションをスキップ: {session.get('title')!r}", file=sys.stderr)
+                    continue
                 title = session.get("title") or ""
                 transcript = await fetch_transcript(client, session)
                 text = transcript_to_text(transcript, title=title)
@@ -432,10 +502,14 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
 
     result = "\n\n---\n\n".join(texts)
     if not result.strip():
-        # セッションはあるのに本文が1文字も取れないのは一時異常の可能性が高い。
-        # スキップマークを作らず失敗扱いにして次回再試行させる。
-        print(f"  → {target_day}: セッション {len(sessions)} 件あるが本文が空。再試行対象として残します。", file=sys.stderr)
-        return 1
+        # ここに到達した時点で全 fetch は成功している（例外は上で rc=1 になる）。
+        # 全セッションが正当に本文空だった日として、スキップマークを作る。
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            print(f"  → {target_day}: サーバーは本文なしだが既存データがあるため保持します。", file=sys.stderr)
+            return 0
+        print(f"  → {target_day}: セッション {len(sessions)} 件、いずれも本文なし。空マークを作成します。")
+        _atomic_write(out_path, "")
+        return 2
 
     _atomic_write(out_path, result)
     print(f"  → 保存しました: {out_path}")
@@ -507,6 +581,12 @@ def main() -> None:
     parser.add_argument("--start-date", type=str, help="バックフィル開始日 (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, help="バックフィル終了日 (YYYY-MM-DD、デフォルト: 昨日)")
     parser.add_argument("--days-back", type=int, default=30, help="バックフィル対象の過去日数 (デフォルト: 30)")
+    parser.add_argument(
+        "--refetch-recent",
+        type=int,
+        default=0,
+        help="バックフィル後、直近N日を取得済みでも再取得して上書きする（文字起こし遅延の取り込み用）",
+    )
     args = parser.parse_args()
 
     if args.login:
@@ -543,19 +623,28 @@ def main() -> None:
         sys.exit(1)
 
     missing = find_missing_dates(DATA_DIR, start, end)
-    if not missing:
+
+    # mori は文字起こし完了まで最大7日かかることがあるため、直近N日は
+    # 取得済みでも再取得して遅れて確定した発話を取り込む（--refetch-recent）
+    refetch: list[date] = []
+    if args.refetch_recent > 0:
+        refetch = [end - timedelta(days=n) for n in range(args.refetch_recent) if end - timedelta(days=n) >= start]
+        refetch = [d for d in refetch if d not in missing]
+
+    targets = sorted(set(missing) | set(refetch))
+    if not targets:
         print(f"{start} から {end} までの全日付が処理済みです（空マーク含む）。")
         return
 
     _refresh_or_exit()
-    print(f"=== mori 自動ダウンロード開始: 未取得 {len(missing)} 件 ===")
+    print(f"=== mori 自動ダウンロード開始: 未取得 {len(missing)} 件 / 再取得 {len(refetch)} 件 ===")
     failed: list[date] = []
-    for i, target in enumerate(missing, 1):
-        print(f"\n[{i}/{len(missing)}] {target} を処理中...")
+    for i, target in enumerate(targets, 1):
+        print(f"\n[{i}/{len(targets)}] {target} を処理中...")
         rc = asyncio.run(download_single_date(target, DATA_DIR))
         if rc == 1:
             failed.append(target)
-        if i < len(missing):
+        if i < len(targets):
             time.sleep(BACKFILL_DAY_INTERVAL_SEC)
 
     if failed:

@@ -27,13 +27,19 @@ class FileTokenStorage:
             with open(self.path, encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
+            # 壊れたファイルは無言で {} にせず、診断用に退避してから空扱いにする
+            try:
+                os.replace(self.path, f"{self.path}.corrupt")
+            except OSError:
+                pass
             return {}
 
     def _save(self, data: dict) -> None:
-        tmp_path = f"{self.path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        tmp_path = f"{self.path}.tmp{os.getpid()}"
+        # 作成時点から 0600（chmod 前の一瞬でも他ユーザーに読ませない）
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, self.path)
 
     async def get_tokens(self) -> OAuthToken | None:

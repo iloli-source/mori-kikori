@@ -1,6 +1,7 @@
 #!/bin/bash
-# 毎日0時5分(JST)にcronから実行され、Mori MCPから前日分の
-# トランスクリプトを取得して data/ に保存する。
+# 毎日0時5分(JST)にcronから実行する。
+# バックフィルモードで動くため、過去に失敗した日も自動で再試行され、
+# 直近3日は文字起こし遅延の取り込みのため取得済みでも再取得する。
 
 set -u
 
@@ -12,24 +13,30 @@ PY_SCRIPT="$SCRIPT_DIR/mori_fetch.py"
 LOG_DIR="$SCRIPT_DIR/logs"
 LOG_FILE="$LOG_DIR/mori-cron.log"
 LOCK_DIR="$SCRIPT_DIR/.run-lock"
+PID_FILE="$LOCK_DIR/pid"
 
 mkdir -p "$LOG_DIR"
 
-# 二重起動防止（mkdir はアトミック）。10分以上古いロックは残骸とみなして奪う。
+# 二重起動防止（mkdir はアトミック）。先行プロセスが死んでいる場合のみロックを引き継ぐ。
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
-    rmdir "$LOCK_DIR" 2>/dev/null || true
-    mkdir "$LOCK_DIR" 2>/dev/null || { echo "$(date '+%F %T') lock busy, skip" >> "$LOG_FILE"; exit 0; }
-  else
-    echo "$(date '+%F %T') another run in progress, skip" >> "$LOG_FILE"
+  OTHER_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ -n "$OTHER_PID" ] && kill -0 "$OTHER_PID" 2>/dev/null; then
+    echo "$(date '+%F %T') another run in progress (pid=$OTHER_PID), skip" >> "$LOG_FILE"
+    exit 0
+  fi
+  # 残骸ロック（プロセス消滅済み）を回収
+  rm -rf "$LOCK_DIR"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "$(date '+%F %T') lock busy, skip" >> "$LOG_FILE"
     exit 0
   fi
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+echo $$ > "$PID_FILE"
+trap 'rm -rf "$LOCK_DIR"' EXIT
 
 {
-  echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (--days-ago 1) ==="
-  "$PYTHON_BIN" "$PY_SCRIPT" --days-ago 1
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (backfill --refetch-recent 3) ==="
+  "$PYTHON_BIN" "$PY_SCRIPT" --refetch-recent 3
   EXIT_CODE=$?
   echo "=== $(date '+%Y-%m-%d %H:%M:%S') END (exit=$EXIT_CODE) ==="
   echo ""

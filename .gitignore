@@ -1,6 +1,7 @@
 .venv/
 tokens.json
-tokens.json.tmp
+tokens.json.tmp*
+tokens.json.corrupt
 data/
 logs/
 __pycache__/

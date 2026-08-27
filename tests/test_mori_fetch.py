@@ -106,3 +106,13 @@ class TestParseIso:
 
         assert _fmt_time("not-a-date") == "--:--:--"
         assert _fmt_time(None) == "--:--:--"
+
+
+class TestTitleOnlyTranscript:
+    def test_title_without_utterances_returns_empty(self):
+        # 発話ゼロならタイトルがあっても本文なし扱い（保存確定させない）
+        assert transcript_to_text({"utterances": []}, title="タイトルだけ") == ""
+
+    def test_title_prepended_when_utterances_exist(self):
+        transcript = {"utterances": [{"started_at": "2026-08-21T09:00:00+09:00", "text": "あ"}]}
+        assert transcript_to_text(transcript, title="T") == "# T\n[09:00:00] あ"
