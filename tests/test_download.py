@@ -213,3 +213,31 @@ class TestDownloadWithRetry:
 
         assert rc == 1
         assert not _out(tmp_path).exists()
+
+    def test_default_retries_is_two(self, tmp_path, stubbed):
+        from mori_fetch import download_with_retry
+
+        calls = {"n": 0}
+
+        class AlwaysFail(StubClient):
+            async def call_tool_json(self, name, args):
+                calls["n"] += 1
+                raise RuntimeError("down")
+
+        stubbed(AlwaysFail())
+
+        rc = asyncio.run(download_with_retry(DAY, str(tmp_path), wait_sec=0))
+
+        # 初回 + 既定リトライ2回 = list_sessions 呼び出し3回
+        assert rc == 1
+        assert calls["n"] == 3
+
+
+class TestNonDictSessionEntries:
+    def test_none_entry_is_error_not_empty_success(self, tmp_path, stubbed):
+        stubbed(StubClient(list_response={"sessions": [None]}))
+
+        rc = asyncio.run(download_single_date(DAY, str(tmp_path)))
+
+        assert rc == 1
+        assert not _out(tmp_path).exists()

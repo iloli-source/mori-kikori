@@ -400,7 +400,11 @@ async def list_sessions_for_date(client: MoriClient, target_day: date) -> list[d
         if not isinstance(page, list):
             # {} や null を「0件」に型強制しない — 空マーク確定はリスト型の [] のみ
             raise RuntimeError(f"list_sessions.sessions is not a list: {type(page).__name__}")
-        sessions.extend(s for s in page if isinstance(s, dict))
+        for s in page:
+            if not isinstance(s, dict):
+                # 非 dict 要素を黙って捨てると [None] 等が「0件成功」に化ける
+                raise RuntimeError(f"list_sessions returned non-dict session: {s!r}")
+        sessions.extend(page)
         if len(page) < LIST_PAGE_SIZE:
             break
         offset += LIST_PAGE_SIZE

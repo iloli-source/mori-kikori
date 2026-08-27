@@ -1,11 +1,12 @@
 #!/bin/bash
 # 毎日0時5分(JST)にcronから実行する。
 # バックフィルモードで動くため、過去に失敗した日も自動で再試行され、
-# 直近7日は文字起こし遅延(最大7日)の取り込みのため取得済みでも再取得する。
+# 直近8日は文字起こし遅延(最大7日+境界余裕1日)の取り込みのため取得済みでも再取得する。
 
 set -u
 
 export TZ=Asia/Tokyo
+export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python3"
@@ -41,8 +42,8 @@ fi
 trap 'rm -rf "$LOCK_DIR"' EXIT
 
 {
-  echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (backfill --refetch-recent 7) ==="
-  "$PYTHON_BIN" "$PY_SCRIPT" --refetch-recent 7
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (backfill --refetch-recent 8) ==="
+  "$PYTHON_BIN" "$PY_SCRIPT" --refetch-recent 8
   EXIT_CODE=$?
   echo "=== $(date '+%Y-%m-%d %H:%M:%S') END (exit=$EXIT_CODE) ==="
   echo ""
