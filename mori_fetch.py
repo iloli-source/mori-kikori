@@ -2,7 +2,9 @@
 
 mori には公開 REST API がないため、公式 MCP サーバー https://mcp.mori.to を
 MCP クライアントとして直接呼び出す。認証は OAuth 2.1（初回のみ --login で
-ブラウザサインイン。以後はリフレッシュトークンで自動更新）。
+ブラウザサインイン。以後は毎回起動時にリフレッシュトークンで自前更新する。
+mcp SDK はトークン有効期限をプロセス内にしか保持せず、再起動後に期限切れ
+アクセストークンを送って 401 → フル再認可に落ちるため、SDK 任せにしない）。
 
 使い方:
     python mori_fetch.py --login          # 初回認証（ブラウザが開く）
@@ -12,41 +14,53 @@ MCP クライアントとして直接呼び出す。認証は OAuth 2.1（初回
     python mori_fetch.py                  # 未取得日を自動バックフィル
 
 終了コード（limitless_fetch.py と同じ規約）:
-    0 = データあり保存成功 / 1 = API・認証エラー / 2 = API成功・データなし
+    0 = データあり保存成功 / 1 = API・認証エラー / 2 = セッションなし（空ファイルでスキップマーク）
+
+※ 空ファイルのスキップマークは「list_sessions が成功し 0 件」の場合のみ作る。
+   通信エラーやセッションはあるのに本文が取れない異常はファイルを作らず 1 で
+   終了し、次回バックフィルで再試行される。
 """
 
 import argparse
 import asyncio
 import http.server
-from contextlib import AsyncExitStack
 import json
 import os
 import sys
-import threading
+import time
 import urllib.parse
 import webbrowser
-from datetime import date, datetime, timedelta
+from contextlib import AsyncExitStack
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import httpx2
 from mcp import ClientSession
 from mcp.client.auth import OAuthClientProvider
 from mcp.client.streamable_http import streamable_http_client
-from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata
+from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata, OAuthToken
 
 from auth_store import TOKENS_FILE, FileTokenStorage
 
 MCP_URL = "https://mcp.mori.to"
+TOKEN_ENDPOINT = "https://mcp.mori.to/oauth/token"
 TIMEZONE = ZoneInfo("Asia/Tokyo")
 CALLBACK_PORT = 8976
 CALLBACK_PATH = "/callback"
-SCOPES = "mori.sessions:read mori.journals:read mori.transcripts:read mori.search:read"
+LOGIN_TIMEOUT_SEC = 300
+# 実際に使う読み取りスコープのみ要求する（最小権限）
+SCOPES = "mori.sessions:read mori.transcripts:read"
 
-# Transcript fetch は 10回/分 制限のため、呼び出し間隔を空ける
+# レート制限: transcript fetch 10回/分, list 60回/分
 TRANSCRIPT_FETCH_INTERVAL_SEC = 7
+LIST_PAGE_INTERVAL_SEC = 1
+BACKFILL_DAY_INTERVAL_SEC = 7
+LIST_PAGE_SIZE = 50
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 FILE_PREFIX = "mori_transcript_"
+
+LOGIN_HINT = "認証が失効しています。`python mori_fetch.py --login` を実行してください。"
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +70,41 @@ FILE_PREFIX = "mori_transcript_"
 
 class AuthRequiredError(Exception):
     """保存済みトークンが無効で、ブラウザ再認証が必要な状態。"""
+
+
+async def ensure_fresh_token() -> None:
+    """保存済みリフレッシュトークンでアクセストークンを更新して保存する。
+
+    毎回の実行冒頭で呼ぶ。mcp SDK は保存トークンの有効期限を復元しないため、
+    ここで必ず新しいアクセストークン（1時間有効）に差し替えてから接続する。
+    リフレッシュトークンも更新されるたびに30日延命される。
+    """
+    storage = FileTokenStorage()
+    tokens = await storage.get_tokens()
+    client_info = await storage.get_client_info()
+    if not tokens or not tokens.refresh_token or not client_info:
+        raise AuthRequiredError(LOGIN_HINT)
+
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": tokens.refresh_token,
+        "client_id": client_info.client_id,
+        "resource": MCP_URL,
+    }
+    try:
+        async with httpx2.AsyncClient(timeout=30) as client:
+            resp = await client.post(TOKEN_ENDPOINT, data=data)
+    except httpx2.HTTPError as e:
+        raise RuntimeError(f"トークンエンドポイントに接続できません: {e}") from e
+
+    if resp.status_code != 200:
+        raise AuthRequiredError(f"トークン更新失敗 (HTTP {resp.status_code}): {resp.text[:200]} — {LOGIN_HINT}")
+
+    new_tokens = OAuthToken.model_validate(resp.json())
+    if not new_tokens.refresh_token:
+        # ローテーションされない実装への保険: 既存のリフレッシュトークンを維持
+        new_tokens = new_tokens.model_copy(update={"refresh_token": tokens.refresh_token})
+    await storage.set_tokens(new_tokens)
 
 
 def _run_callback_server() -> AuthorizationCodeResult:
@@ -70,10 +119,17 @@ def _run_callback_server() -> AuthorizationCodeResult:
                 self.end_headers()
                 return
             params = urllib.parse.parse_qs(parsed.query)
-            result["code"] = (params.get("code") or [None])[0]
+            code = (params.get("code") or [None])[0]
+            error = (params.get("error") or [None])[0]
+            if code is None and error is None:
+                # 認可レスポンス以外のアクセス（favicon 等）は無視して待ち続ける
+                self.send_response(400)
+                self.end_headers()
+                return
+            result["code"] = code
+            result["error"] = error
             result["state"] = (params.get("state") or [None])[0]
             result["iss"] = (params.get("iss") or [None])[0]
-            result["error"] = (params.get("error") or [None])[0]
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -85,8 +141,12 @@ def _run_callback_server() -> AuthorizationCodeResult:
             pass
 
     server = http.server.HTTPServer(("localhost", CALLBACK_PORT), Handler)
+    server.timeout = 1
+    deadline = time.monotonic() + LOGIN_TIMEOUT_SEC
     try:
-        while "code" not in result and "error" not in result:
+        while not result:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"認証待ちが {LOGIN_TIMEOUT_SEC} 秒でタイムアウトしました。")
             server.handle_request()
     finally:
         server.server_close()
@@ -109,7 +169,7 @@ def build_oauth_provider(interactive: bool) -> OAuthClientProvider:
         token_endpoint_auth_method="none",
         grant_types=["authorization_code", "refresh_token"],
         response_types=["code"],
-        client_name="mori-daily-fetch",
+        client_name="mori-kikori",
         scope=SCOPES,
     )
 
@@ -126,10 +186,10 @@ def build_oauth_provider(interactive: bool) -> OAuthClientProvider:
     else:
 
         async def redirect_handler(url: str) -> None:
-            raise AuthRequiredError("認証が失効しています。`python mori_fetch.py --login` を実行してください。")
+            raise AuthRequiredError(LOGIN_HINT)
 
         async def callback_handler() -> AuthorizationCodeResult:
-            raise AuthRequiredError("認証が失効しています。`python mori_fetch.py --login` を実行してください。")
+            raise AuthRequiredError(LOGIN_HINT)
 
     return OAuthClientProvider(
         server_url=MCP_URL,
@@ -138,6 +198,18 @@ def build_oauth_provider(interactive: bool) -> OAuthClientProvider:
         redirect_handler=redirect_handler,
         callback_handler=callback_handler,
     )
+
+
+def _find_auth_error(exc: BaseException) -> AuthRequiredError | None:
+    """ExceptionGroup の入れ子から AuthRequiredError を掘り出す。"""
+    if isinstance(exc, AuthRequiredError):
+        return exc
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            found = _find_auth_error(sub)
+            if found:
+                return found
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -150,30 +222,34 @@ class MoriClient:
 
     def __init__(self, interactive: bool = False) -> None:
         self._interactive = interactive
-        self._stack = None
+        self._stack: AsyncExitStack | None = None
         self.session: ClientSession | None = None
 
     async def __aenter__(self) -> "MoriClient":
         self._stack = AsyncExitStack()
-        auth = build_oauth_provider(self._interactive)
-        http_client = httpx2.AsyncClient(
-            auth=auth,
-            follow_redirects=True,
-            timeout=httpx2.Timeout(30, read=300),
-        )
-        await self._stack.enter_async_context(http_client)
-        read, write = await self._stack.enter_async_context(
-            streamable_http_client(MCP_URL, http_client=http_client)
-        )
-        self.session = await self._stack.enter_async_context(ClientSession(read, write))
-        await self.session.initialize()
+        try:
+            auth = build_oauth_provider(self._interactive)
+            http_client = httpx2.AsyncClient(
+                auth=auth,
+                follow_redirects=True,
+                timeout=httpx2.Timeout(30, read=300),
+            )
+            await self._stack.enter_async_context(http_client)
+            read, write = await self._stack.enter_async_context(
+                streamable_http_client(MCP_URL, http_client=http_client)
+            )
+            self.session = await self._stack.enter_async_context(ClientSession(read, write))
+            await self.session.initialize()
+        except BaseException:
+            await self._stack.aclose()
+            raise
         return self
 
     async def __aexit__(self, *exc) -> None:
         await self._stack.aclose()
 
     async def call_tool_json(self, name: str, args: dict):
-        """ツールを呼び、構造化データ（dict/list）を返す。"""
+        """ツールを呼び、構造化データ（dict/list）を返す。JSON でない応答はエラー。"""
         result = await self.session.call_tool(name, args)
         if result.is_error:
             texts = [c.text for c in result.content if getattr(c, "text", None)]
@@ -185,9 +261,9 @@ class MoriClient:
             if text:
                 try:
                     return json.loads(text)
-                except json.JSONDecodeError:
-                    return text
-        return None
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(f"MCP tool '{name}' returned non-JSON text: {text[:200]}") from e
+        raise RuntimeError(f"MCP tool '{name}' returned empty content")
 
 
 # ---------------------------------------------------------------------------
@@ -195,19 +271,28 @@ class MoriClient:
 # ---------------------------------------------------------------------------
 
 
+def _today_jst() -> date:
+    """Asia/Tokyo の今日。ホスト OS のタイムゾーンに依存しない。"""
+    return datetime.now(TIMEZONE).date()
+
+
 def _parse_iso(ts: str | None) -> datetime | None:
     if not ts:
         return None
     try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if dt.tzinfo is None:
+        # naive はホスト TZ 解釈にせず UTC とみなす
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _fmt_time(ts: str | None) -> str:
     dt = _parse_iso(ts)
     if not dt:
-        return ""
+        return "--:--:--"
     return dt.astimezone(TIMEZONE).strftime("%H:%M:%S")
 
 
@@ -243,50 +328,74 @@ def transcript_to_text(transcript: dict | list, title: str = "") -> str:
     return "\n".join(lines)
 
 
-LIST_PAGE_SIZE = 50
-
-
 async def list_sessions_for_date(client: MoriClient, target_day: date) -> list[dict]:
-    """指定日のセッション一覧を取得する（offset ページング対応）。"""
-    day_str = target_day.isoformat()
+    """指定日のセッション一覧を取得する（offset ページング対応）。
+
+    サーバー側の from/to がどのタイムゾーンの暦日で切られていても取りこぼさない
+    よう前後1日を含めて取得し、クライアント側で Asia/Tokyo の開始日で絞る。
+    開始時刻を解釈できないセッションは除外せず対象日に含める（無音の欠落より
+    重複のほうが害が小さい）。
+    """
+    from_str = (target_day - timedelta(days=1)).isoformat()
+    to_str = (target_day + timedelta(days=1)).isoformat()
     sessions: list[dict] = []
     offset = 0
     while True:
         data = await client.call_tool_json(
             "list_sessions",
-            {"from": day_str, "to": day_str, "limit": LIST_PAGE_SIZE, "offset": offset},
+            {"from": from_str, "to": to_str, "limit": LIST_PAGE_SIZE, "offset": offset},
         )
-        page = data.get("sessions") or [] if isinstance(data, dict) else []
+        if not isinstance(data, dict):
+            raise RuntimeError(f"list_sessions returned unexpected shape: {type(data).__name__}")
+        page = data.get("sessions") or []
         sessions.extend(s for s in page if isinstance(s, dict))
         if len(page) < LIST_PAGE_SIZE:
             break
         offset += LIST_PAGE_SIZE
-    # サーバー側の日付絞り込みに依存せず、クライアント側でも必ず絞る
-    sessions = [s for s in sessions if _session_date(s) == target_day]
-    sessions.sort(key=lambda s: s.get("started_at") or "")
-    return sessions
+        await asyncio.sleep(LIST_PAGE_INTERVAL_SEC)
+
+    selected = [s for s in sessions if _session_date(s) in (target_day, None)]
+    selected.sort(key=lambda s: s.get("started_at") or "")
+    return selected
 
 
 def _transcript_uri(session: dict) -> str:
-    """セッション URI (mori://session/<id>) から Transcript URI を導出する。"""
-    session_uri = session.get("id") or ""
-    return session_uri.replace("mori://session/", "mori://transcript/session/", 1)
+    """セッション ID から Transcript URI を導出する。生 UUID にも対応。"""
+    session_id = str(session.get("id") or "")
+    if session_id.startswith("mori://session/"):
+        return session_id.replace("mori://session/", "mori://transcript/session/", 1)
+    if session_id.startswith("mori://transcript/"):
+        return session_id
+    return f"mori://transcript/session/{session_id}"
 
 
 async def fetch_transcript(client: MoriClient, session: dict) -> dict:
-    """1セッションの Transcript を取得する。"""
-    data = await client.call_tool_json("fetch", {"uri": _transcript_uri(session)})
+    """1セッションの Transcript を取得する。想定外のレスポンス形状はエラー。"""
+    uri = _transcript_uri(session)
+    data = await client.call_tool_json("fetch", {"uri": uri})
     if isinstance(data, dict):
-        obj = data.get("object") or {}
-        return obj.get("transcript") or obj or data
-    return {}
+        transcript = (data.get("object") or {}).get("transcript")
+        if isinstance(transcript, dict):
+            return transcript
+    raise RuntimeError(f"fetch({uri}) returned unexpected shape (no object.transcript)")
+
+
+def _atomic_write(path: str, content: str) -> None:
+    """一時ファイル経由で書き込み、途中クラッシュでも壊れたファイルを残さない。"""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, path)
 
 
 async def download_single_date(target_day: date, data_dir: str) -> int:
     """指定日の全セッションの Transcript を取得して1ファイルに保存する。
 
     Returns:
-        0 = データあり保存成功 / 1 = API失敗（ファイル変更なし） / 2 = データなし（0byteファイル作成）
+        0 = データあり保存成功
+        1 = API・認証エラー、またはセッションはあるが本文が空（ファイル変更なし・次回再試行）
+        2 = list_sessions 成功でセッション0件（空ファイルでスキップマーク）
     """
     out_path = os.path.join(data_dir, f"{FILE_PREFIX}{target_day.isoformat()}.txt")
     print(f"Fetching mori sessions for {target_day} (Asia/Tokyo) ...")
@@ -294,6 +403,10 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
     try:
         async with MoriClient(interactive=False) as client:
             sessions = await list_sessions_for_date(client, target_day)
+            if not sessions:
+                print(f"  → {target_day}: セッションはありませんでした。")
+                _atomic_write(out_path, "")
+                return 2
             texts: list[str] = []
             for i, session in enumerate(sessions):
                 title = session.get("title") or ""
@@ -306,19 +419,25 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
     except AuthRequiredError as e:
         print(f"  → 認証エラー: {e}", file=sys.stderr)
         return 1
+    except BaseExceptionGroup as eg:
+        auth_err = _find_auth_error(eg)
+        if auth_err:
+            print(f"  → 認証エラー: {auth_err}", file=sys.stderr)
+        else:
+            print(f"  → API error for {target_day}: {eg!r}", file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"  → API error for {target_day}: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
     result = "\n\n---\n\n".join(texts)
     if not result.strip():
-        print(f"  → {target_day}: トランスクリプトは見つかりませんでした。")
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write("")
-        return 2
+        # セッションはあるのに本文が1文字も取れないのは一時異常の可能性が高い。
+        # スキップマークを作らず失敗扱いにして次回再試行させる。
+        print(f"  → {target_day}: セッション {len(sessions)} 件あるが本文が空。再試行対象として残します。", file=sys.stderr)
+        return 1
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(result)
+    _atomic_write(out_path, result)
     print(f"  → 保存しました: {out_path}")
     return 0
 
@@ -352,6 +471,7 @@ async def do_login() -> int:
 
 async def do_list_tools() -> int:
     """ツール一覧と入力スキーマを表示する（デバッグ用）。"""
+    await ensure_fresh_token()
     async with MoriClient(interactive=False) as client:
         tools = await client.session.list_tools()
         for t in tools.tools:
@@ -366,14 +486,26 @@ async def do_list_tools() -> int:
 # ---------------------------------------------------------------------------
 
 
+def _refresh_or_exit() -> None:
+    """実行冒頭のトークン更新。失敗したら明確なメッセージで終了コード1。"""
+    try:
+        asyncio.run(ensure_fresh_token())
+    except AuthRequiredError as e:
+        print(f"認証エラー: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"トークン更新エラー: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mori MCP から指定日のトランスクリプトを取得")
     parser.add_argument("--login", action="store_true", help="初回 OAuth 認証（ブラウザが開く）")
     parser.add_argument("--list-tools", action="store_true", help="MCP ツール一覧とスキーマを表示")
     parser.add_argument("--date", type=str, help="取得する日付 (YYYY-MM-DD)")
-    parser.add_argument("--days-ago", type=int, help="何日前のデータを取得するか (例: 1 = 昨日)")
+    parser.add_argument("--days-ago", type=int, help="何日前のデータを取得するか (0=今日, 1=昨日)")
     parser.add_argument("--start-date", type=str, help="バックフィル開始日 (YYYY-MM-DD)")
-    parser.add_argument("--end-date", type=str, help="バックフィル終了日 (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, help="バックフィル終了日 (YYYY-MM-DD、デフォルト: 昨日)")
     parser.add_argument("--days-back", type=int, default=30, help="バックフィル対象の過去日数 (デフォルト: 30)")
     args = parser.parse_args()
 
@@ -383,6 +515,7 @@ def main() -> None:
         sys.exit(asyncio.run(do_list_tools()))
 
     os.makedirs(DATA_DIR, exist_ok=True)
+    today = _today_jst()
 
     if args.date:
         try:
@@ -390,25 +523,31 @@ def main() -> None:
         except ValueError:
             print("エラー: 日付は YYYY-MM-DD 形式で指定してください。", file=sys.stderr)
             sys.exit(1)
+        _refresh_or_exit()
         sys.exit(asyncio.run(download_single_date(target, DATA_DIR)))
 
-    if args.days_ago:
-        target = date.today() - timedelta(days=args.days_ago)
+    if args.days_ago is not None:
+        if args.days_ago < 0:
+            print("エラー: --days-ago は 0 以上を指定してください。", file=sys.stderr)
+            sys.exit(1)
+        target = today - timedelta(days=args.days_ago)
+        _refresh_or_exit()
         sys.exit(asyncio.run(download_single_date(target, DATA_DIR)))
 
-    # デフォルト: 未取得日の自動バックフィル
+    # デフォルト: 未取得日の自動バックフィル（当日は対象外 — 記録が確定していないため）
     try:
-        start = date.fromisoformat(args.start_date) if args.start_date else date.today() - timedelta(days=args.days_back)
-        end = date.fromisoformat(args.end_date) if args.end_date else date.today()
+        start = date.fromisoformat(args.start_date) if args.start_date else today - timedelta(days=args.days_back)
+        end = date.fromisoformat(args.end_date) if args.end_date else today - timedelta(days=1)
     except ValueError:
         print("エラー: 日付は YYYY-MM-DD 形式で指定してください。", file=sys.stderr)
         sys.exit(1)
 
     missing = find_missing_dates(DATA_DIR, start, end)
     if not missing:
-        print(f"{start} から {end} までの全データがダウンロード済みです。")
+        print(f"{start} から {end} までの全日付が処理済みです（空マーク含む）。")
         return
 
+    _refresh_or_exit()
     print(f"=== mori 自動ダウンロード開始: 未取得 {len(missing)} 件 ===")
     failed: list[date] = []
     for i, target in enumerate(missing, 1):
@@ -416,6 +555,8 @@ def main() -> None:
         rc = asyncio.run(download_single_date(target, DATA_DIR))
         if rc == 1:
             failed.append(target)
+        if i < len(missing):
+            time.sleep(BACKFILL_DAY_INTERVAL_SEC)
 
     if failed:
         print(f"失敗した日付: {', '.join(str(d) for d in failed)}", file=sys.stderr)

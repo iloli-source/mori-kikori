@@ -7,6 +7,7 @@ mcp SDK の TokenStorage プロトコル実装。tokens.json に
 
 import json
 import os
+import time
 
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
@@ -36,14 +37,25 @@ class FileTokenStorage:
         os.replace(tmp_path, self.path)
 
     async def get_tokens(self) -> OAuthToken | None:
+        """保存済みトークンを返す。expires_in は取得時刻からの残り秒数に補正する。
+
+        mcp SDK はトークンの有効期限をプロセス内にしか持たないため、保存時の
+        obtained_at を使って残存有効期間を計算し直す。期限切れなら 0 になる。
+        """
         data = self._load()
         if "tokens" not in data:
             return None
-        return OAuthToken.model_validate(data["tokens"])
+        tokens = OAuthToken.model_validate(data["tokens"])
+        obtained_at = data.get("obtained_at")
+        if obtained_at is not None and tokens.expires_in is not None:
+            remaining = int(obtained_at + tokens.expires_in - time.time())
+            tokens = tokens.model_copy(update={"expires_in": max(0, remaining)})
+        return tokens
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
         data = self._load()
         data["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
+        data["obtained_at"] = time.time()
         self._save(data)
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:

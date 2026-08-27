@@ -44,7 +44,7 @@ class TestTranscriptToText:
 
     def test_skips_empty_text(self):
         transcript = {"utterances": [{"text": "  "}, {"text": "メモ"}]}
-        assert transcript_to_text(transcript) == "[] メモ"
+        assert transcript_to_text(transcript) == "[--:--:--] メモ"
 
     def test_empty_transcript_returns_empty(self):
         assert transcript_to_text({}) == ""
@@ -69,6 +69,14 @@ class TestTranscriptUri:
         session = {"id": "mori://session/d12f88e9-7b6f-4f36-bac2-e93ebe5a210f"}
         assert _transcript_uri(session) == "mori://transcript/session/d12f88e9-7b6f-4f36-bac2-e93ebe5a210f"
 
+    def test_accepts_raw_uuid(self):
+        session = {"id": "d12f88e9-7b6f-4f36-bac2-e93ebe5a210f"}
+        assert _transcript_uri(session) == "mori://transcript/session/d12f88e9-7b6f-4f36-bac2-e93ebe5a210f"
+
+    def test_passes_through_transcript_uri(self):
+        session = {"id": "mori://transcript/session/abc"}
+        assert _transcript_uri(session) == "mori://transcript/session/abc"
+
 
 class TestFindMissingDates:
     def test_detects_missing_dates(self, tmp_path):
@@ -84,3 +92,17 @@ class TestFindMissingDates:
     def test_all_present_returns_empty(self, tmp_path):
         (tmp_path / "mori_transcript_2026-08-20.txt").write_text("")
         assert find_missing_dates(str(tmp_path), date(2026, 8, 20), date(2026, 8, 20)) == []
+
+
+class TestParseIso:
+    def test_naive_timestamp_is_treated_as_utc(self):
+        from mori_fetch import _fmt_time
+
+        # naive な "03:00" は UTC とみなし JST 12:00 になる（ホストTZ非依存）
+        assert _fmt_time("2026-08-21T03:00:00") == "12:00:00"
+
+    def test_invalid_timestamp_returns_placeholder(self):
+        from mori_fetch import _fmt_time
+
+        assert _fmt_time("not-a-date") == "--:--:--"
+        assert _fmt_time(None) == "--:--:--"
