@@ -640,7 +640,12 @@ class _Parser(argparse.ArgumentParser):
 
 def main() -> None:
     parser = _Parser(
-        description="Mori MCP から会話トランスクリプトを取得（引数なしで過去30日の未取得日を自動バックフィル）"
+        description="Mori MCP から会話トランスクリプトを取得（引数なしで過去30日の未取得日を自動バックフィル）",
+        epilog=(
+            "単日系(--date/--days-ago)とバックフィル系(--start-date/--end-date/--days-back/"
+            "--refetch-recent)は排他。終了コード: 単日=0成功/1エラー/2データなし、"
+            "バックフィル=0完了/1失敗、引数エラー=1"
+        ),
     )
     parser.add_argument("--login", action="store_true", help="初回 OAuth 認証（ブラウザが開く）")
     parser.add_argument("--list-tools", action="store_true", help="MCP ツール一覧とスキーマを表示")

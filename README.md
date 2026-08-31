@@ -193,8 +193,9 @@ tail -3 logs/mori-cron.log         # 「END (exit=0)」で終わっていれば�
   空マークのままになる。気づいたら `--date YYYY-MM-DD` で個別に再取得すれば取り込める
   （既存の実データをより小さい内容で上書きすることはない）
 - **launchd に登録したのに何も起きない**: 上記「動作確認」の順に確認。`launchctl print` で
-  登録が見えない場合は bootstrap をやり直す。`logs/mori-launchd.log` に traceback がある場合は
-  venv 未作成や Python バージョン（3.11 未満）を疑う
+  登録が見えない場合は `./install_launchd.sh` をやり直す。Python の traceback や
+  venv 未作成のエラーは `logs/mori-cron.log` に出る（`logs/mori-launchd.log` は
+  スクリプト自体が起動できなかった場合にだけ内容が入る）
 - **`--login` が「接続拒否」やタイムアウトで失敗する**: ポート `8976` を別プロセスが使っていないか
   確認（`lsof -i :8976`）し、ブラウザのタブを閉じてから `--login` をやり直す。認可画面の応答が
   速すぎて一時的に競合することがあるが、再実行で通る

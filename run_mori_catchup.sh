@@ -25,11 +25,6 @@ NOTIFY_AFTER_FAILURES=3
 
 mkdir -p "$LOG_DIR"
 
-# 簡易ローテーション: 毎時のスキップ行で肥大しないよう、512KB を超えたら直近500行だけ残す
-if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 524288 ]; then
-  tail -500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
-fi
-
 notify() {
   # macOS のみデスクトップ通知（osascript が無い環境では黙ってスキップ）
   command -v osascript >/dev/null 2>&1 || return 0
@@ -79,6 +74,12 @@ fi
 # 所有者の場合のみロックを片付ける — 競合側のロックを消さない
 trap '[ "$(cat "$CATCHUP_PID_FILE" 2>/dev/null)" = "$$" ] && rm -rf "$CATCHUP_LOCK"' EXIT
 
+# 簡易ローテーション: 毎時のスキップ行で肥大しないよう、512KB を超えたら直近500行だけ残す。
+# ロック取得後に行うことで、同時起動とのローテーション競合によるログ喪失を防ぐ。
+if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 524288 ]; then
+  tail -500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+fi
+
 # run_mori_daily.sh は「別プロセス実行中でスキップ」時も exit 0 を返すため、
 # その場合に成功スタンプを書いてしまわないよう、先行実行中なら何もせず抜ける。
 # （手動実行との一瞬のレースは残るが、誤スタンプしても翌日のバックフィル
@@ -92,6 +93,10 @@ if [ -d "$SCRIPT_DIR/.run-lock" ]; then
 fi
 
 log "=== catchup start (last_success=${LAST_SUCCESS:-none}) ==="
+# 今回の実行で新しく書かれた本体ログだけを失敗原因の判定に使う
+# （過去の認証エラー行に反応して誤通知しないため）
+CRON_LOG="$LOG_DIR/mori-cron.log"
+CRON_LOG_START="$(wc -l < "$CRON_LOG" 2>/dev/null || echo 0)"
 /bin/bash "$SCRIPT_DIR/run_mori_daily.sh"
 EXIT_CODE=$?
 
@@ -106,7 +111,7 @@ else
   # 認証失効はユーザー操作(--login)がないと永久に直らないため即通知。
   # それ以外の原因（API変更・ネットワーク等）も、連続 N 回失敗したら通知して
   # サイレント停止を防ぐ。
-  if tail -30 "$LOG_DIR/mori-cron.log" 2>/dev/null | grep -q "認証が失効"; then
+  if tail -n +$((CRON_LOG_START + 1)) "$CRON_LOG" 2>/dev/null | grep -q "認証が失効"; then
     notify "mori の認証が失効しています。リポジトリ直下で .venv/bin/python mori_fetch.py --login を実行してください。"
   elif [ "$FAILS" -ge "$NOTIFY_AFTER_FAILURES" ]; then
     notify "mori の取得が ${FAILS} 回連続で失敗しています。logs/mori-cron.log を確認してください。"
