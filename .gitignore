@@ -3,7 +3,9 @@ tokens.json
 tokens.json.tmp*
 tokens.json.corrupt
 data/
-logs/
+logs/*
+!logs/.gitkeep
 __pycache__/
 .DS_Store
 .run-lock/
+.catchup-lock/

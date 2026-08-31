@@ -60,7 +60,7 @@ LIST_PAGE_SIZE = 50
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 FILE_PREFIX = "mori_transcript_"
 
-LOGIN_HINT = "認証が失効しています。`python mori_fetch.py --login` を実行してください。"
+LOGIN_HINT = "認証が失効しています。リポジトリ直下で `.venv/bin/python mori_fetch.py --login` を実行してください。"
 
 
 # ---------------------------------------------------------------------------
@@ -627,14 +627,16 @@ def _refresh_or_exit() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Mori MCP から指定日のトランスクリプトを取得")
+    parser = argparse.ArgumentParser(
+        description="Mori MCP から会話トランスクリプトを取得（引数なしで過去30日の未取得日を自動バックフィル）"
+    )
     parser.add_argument("--login", action="store_true", help="初回 OAuth 認証（ブラウザが開く）")
     parser.add_argument("--list-tools", action="store_true", help="MCP ツール一覧とスキーマを表示")
     parser.add_argument("--date", type=str, help="取得する日付 (YYYY-MM-DD)")
     parser.add_argument("--days-ago", type=int, help="何日前のデータを取得するか (0=今日, 1=昨日)")
     parser.add_argument("--start-date", type=str, help="バックフィル開始日 (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, help="バックフィル終了日 (YYYY-MM-DD、デフォルト: 昨日)")
-    parser.add_argument("--days-back", type=int, default=30, help="バックフィル対象の過去日数 (デフォルト: 30)")
+    parser.add_argument("--days-back", type=int, default=None, help="バックフィル対象の過去日数 (デフォルト: 30)")
     parser.add_argument(
         "--refetch-recent",
         type=int,
@@ -642,6 +644,38 @@ def main() -> None:
         help="バックフィル後、直近N日を取得済みでも再取得して上書きする（文字起こし遅延の取り込み用）",
     )
     args = parser.parse_args()
+
+    # 矛盾した引数・不正値は黙って無視せず exit 1 で拒否する。
+    # exit 2 は「全取得成功でデータなし」の契約値なのでバリデーションには使わない。
+    single_day_opts = args.date is not None or args.days_ago is not None
+    backfill_opts = (
+        args.start_date is not None
+        or args.end_date is not None
+        or args.days_back is not None
+        or args.refetch_recent != 0
+    )
+    if args.login and args.list_tools:
+        print("エラー: --login と --list-tools は併用できません。", file=sys.stderr)
+        sys.exit(1)
+    if (args.login or args.list_tools) and (single_day_opts or backfill_opts):
+        print("エラー: --login / --list-tools は取得オプションと併用できません。", file=sys.stderr)
+        sys.exit(1)
+    if args.date is not None and args.days_ago is not None:
+        print("エラー: --date と --days-ago は併用できません。", file=sys.stderr)
+        sys.exit(1)
+    if single_day_opts and backfill_opts:
+        print(
+            "エラー: --date / --days-ago はバックフィル用オプション"
+            "（--start-date / --end-date / --days-back / --refetch-recent）と併用できません。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.days_back is not None and args.days_back < 1:
+        print("エラー: --days-back は 1 以上を指定してください。", file=sys.stderr)
+        sys.exit(1)
+    if args.refetch_recent < 0:
+        print("エラー: --refetch-recent は 0 以上を指定してください。", file=sys.stderr)
+        sys.exit(1)
 
     if args.login:
         sys.exit(asyncio.run(do_login()))
@@ -669,11 +703,22 @@ def main() -> None:
         sys.exit(asyncio.run(download_with_retry(target, DATA_DIR)))
 
     # デフォルト: 未取得日の自動バックフィル（当日は対象外 — 記録が確定していないため）
+    days_back = args.days_back if args.days_back is not None else 30
     try:
-        start = date.fromisoformat(args.start_date) if args.start_date else today - timedelta(days=args.days_back)
+        start = date.fromisoformat(args.start_date) if args.start_date else today - timedelta(days=days_back)
         end = date.fromisoformat(args.end_date) if args.end_date else today - timedelta(days=1)
     except ValueError:
         print("エラー: 日付は YYYY-MM-DD 形式で指定してください。", file=sys.stderr)
+        sys.exit(1)
+    if end >= today:
+        print(
+            f"エラー: --end-date に当日以降 ({end}) は指定できません。"
+            "当日の記録は未確定のため、バックフィルは昨日までを対象とします。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if start > end:
+        print(f"エラー: 開始日 {start} が終了日 {end} より後です。範囲を確認してください。", file=sys.stderr)
         sys.exit(1)
 
     missing = find_missing_dates(DATA_DIR, start, end)

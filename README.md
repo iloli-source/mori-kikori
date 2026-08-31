@@ -33,13 +33,32 @@ mori には公開 REST API がない（API キー・PAT・webhook は「将来�
 
 ## セットアップ
 
+前提:
+
+- **Python 3.11 以上**（`BaseExceptionGroup` を使用しているため。`python3 --version` で確認。
+  macOS 付属の `/usr/bin/python3` は古いことが多いので、満たさない場合は `brew install python` 等で導入する）
+- 初回認証にはブラウザが必要（OAuth のリダイレクトを `localhost:8976` で受けるため、**同じマシンのブラウザ**でサインインする）。ヘッドレスサーバーに入れる場合は手元のPCから `ssh -L 8976:localhost:8976 <server>` でポートフォワードした上で `--login` を実行し、表示されるURLを手元のブラウザで開く
+
 ```bash
+git clone https://github.com/iloli-source/mori-kikori.git
+cd mori-kikori          # 以降のコマンドはすべてリポジトリ直下で実行する
+
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
 # 初回のみ: ブラウザで mori にサインイン
 .venv/bin/python mori_fetch.py --login
+
+# 動作確認: まず昨日1日分だけ取得してみる（1日あたり1〜3分程度かかる）
+.venv/bin/python mori_fetch.py --days-ago 1
+ls -la data/            # mori_transcript_YYYY-MM-DD.txt ができていれば成功
 ```
+
+昨日録音がなかった場合は 0 バイトのスキップマークが作られ、終了コード `2` で終わる（これも正常。
+中身が入るのは録音があった日だけ）。
+
+いきなり引数なしで実行すると過去30日のバックフィルが走り、レート制限回避の
+待機（セッション間7秒）のため数十分かかることがある。まず1日分で疎通確認を推奨。
 
 ## 使い方
 
@@ -60,7 +79,9 @@ python3 -m venv .venv
 | `--days-back N` | バックフィル対象の過去日数（デフォルト 30） |
 | `--refetch-recent N` | バックフィル後、直近 N 日を取得済みでも再取得して上書き（文字起こし遅延の取り込み用。日次運用では `8` を推奨） |
 | `--login` | 初回 OAuth 認証（ブラウザが開く） |
-| `--list-tools` | MCP ツール一覧とスキーマを表示 |
+| `--list-tools` | MCP ツール一覧とスキーマを表示（要・認証済み） |
+
+単日系（`--date` / `--days-ago`）とバックフィル系（`--start-date` / `--end-date` / `--days-back` / `--refetch-recent`）は排他で、併用するとエラーで拒否される。不正な範囲（開始日 > 終了日、`--days-back 0` 等）も黙って成功扱いにはならずエラーになる。
 
 日付は常に **Asia/Tokyo** 基準（ホスト OS のタイムゾーンに依存しない）。
 バックフィルは当日を対象にしない（その日の記録がまだ確定していないため）。
@@ -78,12 +99,14 @@ python3 -m venv .venv
 ...
 ```
 
-終了コード: `0` = 保存成功 / `1` = API・認証エラー（ファイル変更なし・次回バックフィルで再試行）/ `2` = 全取得が成功しデータなし（0 バイトファイルでスキップマーク）
+終了コード（**単日実行** `--date` / `--days-ago` のとき）: `0` = 保存成功 / `1` = API・認証エラー（ファイル変更なし・次回バックフィルで再試行）/ `2` = 全取得が成功しデータなし（0 バイトファイルでスキップマーク）
+
+**バックフィル実行**（引数なし・`--refetch-recent` 等）の終了コードは `0` = 全日付処理完了（データなしの日はスキップマークを書いて成功扱い）/ `1` = 1日以上失敗、の2値。`2` は返らないので、日次ラッパーの監視は `0` / `非0` で判定する。
 
 再取得時にサーバーが一時的に 0 件・縮小データを返しても、既存の実データを空マークや
 より小さい内容で上書きすることはない（サイズ比較によるヒューリスティックなガード）。一時的な接続断は
-バックオフ付きで最大 2 回（15 秒 → 45 秒）自動リトライし、それでも失敗した日は翌晩の
-バックフィルで再試行される。
+バックオフ付きで最大 2 回（15 秒 → 45 秒）自動リトライし、それでも失敗した日は次回の
+バックフィル（launchd 運用なら毎時リトライ、cron なら翌晩）で再試行される。
 
 書き込みはアトミック（tmp → rename）で、途中クラッシュしても壊れたファイルは残らない。
 
@@ -98,32 +121,89 @@ python3 -m venv .venv
 ### macOS: launchd（推奨）
 
 cron は Mac がスリープ/電源断中に発火せず、起きた後も取りこぼし分を実行しない。
-macOS では launchd + `run_mori_catchup.sh` を使うと「毎日 0:15」「PC を開いた時」「毎時リトライ」の
-3 経路で起動し、その日まだ成功していない場合のみ日次実行が走る（成功済みの日はスタンプ
+macOS では launchd + `run_mori_catchup.sh` を使うと次の 3 経路で起動する:
+
+- 毎日 0:15（`StartCalendarInterval`。Mac のシステム時刻基準。スリープで跨いだ場合は起床直後に発火）
+- ログイン時（`RunAtLoad`。電源断で 0:15 を逃した日のキャッチアップ）
+- 1 時間ごと（`StartInterval`。当日失敗時の自動リトライ。スリープ中の分は発火しないが、上の2経路が拾う）
+
+その日まだ成功していない場合のみ日次実行が走る（成功済みの日はスタンプ
 `logs/.last-success-date` により即スキップ）。失敗した日はスタンプが残らず、次の発火で自動再試行される。
 
+登録（**必ずリポジトリ直下で実行**。`$(pwd)` がそのまま plist に埋め込まれるため）:
+
 ```bash
-# /path/to/mori-kikori を clone 先に置換してから配置
 sed "s|/path/to/mori-kikori|$(pwd)|g" com.iloli.mori-kikori.plist.example \
   > ~/Library/LaunchAgents/com.iloli.mori-kikori.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iloli.mori-kikori.plist
 ```
 
-解除は `launchctl bootout gui/$(id -u)/com.iloli.mori-kikori`。
+> 注意: `RunAtLoad` により **bootstrap した瞬間に初回実行が始まる**。まだ取得していない過去分が
+> 多いと初回は数十分かかる（進捗は `tail -f logs/mori-cron.log` で見える）。
+
+登録できたか必ず検証する:
+
+```bash
+plutil -lint ~/Library/LaunchAgents/com.iloli.mori-kikori.plist          # 構文OKか
+# plist が指すスクリプトが実在するか（置換ミスならここで NG になる）
+test -x "$(plutil -extract ProgramArguments.1 raw ~/Library/LaunchAgents/com.iloli.mori-kikori.plist)" \
+  && echo "path OK" || echo "path NG: 置換をやり直す"
+launchctl print gui/$(id -u)/com.iloli.mori-kikori | head -5             # 登録されているか
+```
+
+**実際に動いたこと**まで確認する（登録成功≠実行成功）:
+
+```bash
+launchctl kickstart gui/$(id -u)/com.iloli.mori-kikori
+sleep 5; tail -3 logs/mori-catchup.log
+# 「catchup start」（実行開始）か「already succeeded today — skip」（本日成功済み）が
+# 出ていれば launchd 経由の起動は正常。何も増えなければ logs/mori-launchd.log を見る
+```
+
+plist を修正して再登録するときは、いったん解除してから登録し直す:
+
+```bash
+launchctl bootout gui/$(id -u)/com.iloli.mori-kikori   # 解除（未登録なら「No such process」で無害）
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iloli.mori-kikori.plist
+```
 
 ### Linux 等: cron
 
 ```
-5 0 * * * ~/mori-kikori/run_mori_daily.sh
+5 0 * * * /absolute/path/to/mori-kikori/run_mori_daily.sh
 ```
 
-毎日 0:05 (JST) にバックフィルモードで実行する（パスは clone 先に合わせて変更）。
-常時起動のマシンであれば cron で十分。
+常時起動のマシンであれば cron で十分。注意点:
+
+- **cron の発火時刻はホストのタイムゾーン基準**。JST 0:05 に動かしたい場合、ホストが UTC なら `CRON_TZ=Asia/Tokyo` を crontab の先頭に書くか、`5 15 * * *`（UTC）と読み替える。取得対象日の計算自体はスクリプト内で常に JST なのでズレない
+- パスは `~` に頼らず絶対パスで書く（cron の `~` 展開はシェル依存）
+- 初回の `--login` はブラウザが必要（ヘッドレスサーバーの場合は上記セットアップのポートフォワード手順を参照）
+
+## 動作確認（動いているか不安になったら）
+
+| 見る場所 | 内容 |
+|---|---|
+| `data/` | 取得結果本体。`mori_transcript_昨日.txt` があれば正常（0 バイトは「録音なしの日」のマーク） |
+| `logs/.last-success-date` | launchd キャッチアップの最終成功日（JST）。今日の日付なら「今日の実行（＝昨日までの取り込み）」は完了済み。cron 運用ではこのファイルは作られない |
+| `logs/mori-cron.log` | 取得処理の本体ログ（何日分を取得し、失敗が何か） |
+| `logs/mori-catchup.log` | launchd キャッチアップの判定ログ。成功済みの日も毎時 `already succeeded today — skip` が1行残るので、**この行が毎時増えていれば launchd は生きている** |
+| `logs/mori-launchd.log` | launchd が捕まえた標準出力/エラー（通常は空。ここに Python の traceback が出ていたら環境異常） |
+
+認証失効すると `logs/mori-cron.log` に「認証が失効しています」が記録され続け、launchd 運用の macOS では**デスクトップ通知**でも知らせる。数日 `data/` が増えていないと気づいたら、まず上の表の順にログを見る。
 
 ## トラブルシューティング
 
 - **「認証が失効しています」エラー**: 30 日以上実行されなかった等でリフレッシュトークンが失効。
-  `.venv/bin/python mori_fetch.py --login` で再サインインする
+  リポジトリ直下で `.venv/bin/python mori_fetch.py --login` を実行して再サインインする
+- **30 日を超えて止まっていた場合**: 再ログイン後、デフォルトのバックフィルは過去 30 日分しか
+  見ないため、それより前の欠落日は `--days-back 90` や `--start-date 2026-06-01` のように
+  範囲を広げて一度手動実行すれば回収できる
+- **launchd に登録したのに何も起きない**: 上記「動作確認」の順に確認。`launchctl print` で
+  登録が見えない場合は bootstrap をやり直す。`logs/mori-launchd.log` に traceback がある場合は
+  venv 未作成や Python バージョン（3.11 未満）を疑う
+- **`--login` が「接続拒否」やタイムアウトで失敗する**: ポート `8976` を別プロセスが使っていないか
+  確認（`lsof -i :8976`）し、ブラウザのタブを閉じてから `--login` をやり直す。認可画面の応答が
+  速すぎて一時的に競合することがあるが、再実行で通る
 - **レート制限**: Transcript fetch は 10 回/分のため、セッション間に 7 秒待機している。
   1 日のセッション数が多いと数分かかるのは正常
 - **テスト**: `.venv/bin/python -m pytest tests/ -q`
