@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd template.
+  1. /path/to/mori-kikori を clone 先の絶対パスに置換
+  2. cp して ~/Library/LaunchAgents/com.iloli.mori-kikori.plist に配置
+  3. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iloli.mori-kikori.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.iloli.mori-kikori</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/path/to/mori-kikori/run_mori_catchup.sh</string>
+    </array>
+
+    <!-- 毎日 0:15 定時。スリープ中に跨いだ分は起床直後に 1 回だけ発火する -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>0</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+
+    <!-- ログイン時 (= PC を開く/電源投入後) に 1 回発火 → 電源断キャッチアップ -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 1 時間ごと。当日失敗時の自動リトライ (成功済みならスタンプで即スキップ) -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TZ</key>
+        <string>Asia/Tokyo</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/path/to/mori-kikori/logs/mori-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/path/to/mori-kikori/logs/mori-launchd.log</string>
+</dict>
+</plist>

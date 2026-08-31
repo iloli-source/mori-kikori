@@ -62,17 +62,38 @@ python3 -m venv .venv
 
 書き込みはアトミック（tmp → rename）で、途中クラッシュしても壊れたファイルは残らない。
 
-## cron
+## スケジュール実行
+
+日次実行は `run_mori_daily.sh`（バックフィルモード）が担う。
+単日取得ではなくバックフィルで動かすことで、**過去に失敗した日が翌日以降に自動で再試行される**。
+さらに直近 8 日は取得済みでも再取得して上書きする（mori の文字起こしは最大 7 日遅れる
+ことがあるため。遅延の末尾が深夜の実行タイミングを跨いでも拾えるよう +1 日の余裕を持たせている）。
+ログ: `logs/mori-cron.log`。二重起動は PID 生存確認付きロックで防止。
+
+### macOS: launchd（推奨）
+
+cron は Mac がスリープ/電源断中に発火せず、起きた後も取りこぼし分を実行しない。
+macOS では launchd + `run_mori_catchup.sh` を使うと「毎日 0:15」「PC を開いた時」「毎時リトライ」の
+3 経路で起動し、その日まだ成功していない場合のみ日次実行が走る（成功済みの日はスタンプ
+`logs/.last-success-date` により即スキップ）。失敗した日はスタンプが残らず、次の発火で自動再試行される。
+
+```bash
+# /path/to/mori-kikori を clone 先に置換してから配置
+sed "s|/path/to/mori-kikori|$(pwd)|g" com.iloli.mori-kikori.plist.example \
+  > ~/Library/LaunchAgents/com.iloli.mori-kikori.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iloli.mori-kikori.plist
+```
+
+解除は `launchctl bootout gui/$(id -u)/com.iloli.mori-kikori`。
+
+### Linux 等: cron
 
 ```
 5 0 * * * ~/mori-kikori/run_mori_daily.sh
 ```
 
 毎日 0:05 (JST) にバックフィルモードで実行する（パスは clone 先に合わせて変更）。
-単日取得ではなくバックフィルで動かすことで、**過去に失敗した日が翌日以降に自動で再試行される**。
-さらに直近 8 日は取得済みでも再取得して上書きする（mori の文字起こしは最大 7 日遅れる
-ことがあるため。遅延の末尾が翌朝 0:05 の実行タイミングを跨いでも拾えるよう +1 日の余裕を持たせている）。
-ログ: `logs/mori-cron.log`。二重起動は PID 生存確認付きロックで防止。
+常時起動のマシンであれば cron で十分。
 
 ## トラブルシューティング
 
