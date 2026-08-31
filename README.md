@@ -43,6 +43,7 @@ mori には公開 REST API がない（API キー・PAT・webhook は「将来�
 git clone https://github.com/iloli-source/mori-kikori.git
 cd mori-kikori          # 以降のコマンドはすべてリポジトリ直下で実行する
 
+python3 -c 'import sys; assert sys.version_info >= (3, 11), f"Python 3.11+ が必要: {sys.version}"'
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
@@ -130,42 +131,32 @@ macOS では launchd + `run_mori_catchup.sh` を使うと次の 3 経路で起�
 その日まだ成功していない場合のみ日次実行が走る（成功済みの日はスタンプ
 `logs/.last-success-date` により即スキップ）。失敗した日はスタンプが残らず、次の発火で自動再試行される。
 
-登録（**必ずリポジトリ直下で実行**。`$(pwd)` がそのまま plist に埋め込まれるため）:
+登録はインストーラ1発（plist 生成 → 構文検証 → 登録 → 登録確認まで自動。再実行すれば更新にもなる）:
 
 ```bash
-sed "s|/path/to/mori-kikori|$(pwd)|g" com.iloli.mori-kikori.plist.example \
-  > ~/Library/LaunchAgents/com.iloli.mori-kikori.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iloli.mori-kikori.plist
+./install_launchd.sh
 ```
 
-> 注意: `RunAtLoad` により **bootstrap した瞬間に初回実行が始まる**。まだ取得していない過去分が
-> 多いと初回は数十分かかる（進捗は `tail -f logs/mori-cron.log` で見える）。
+> 注意:
+> - `RunAtLoad` により **登録した瞬間に初回実行が始まる**。まだ取得していない過去分が多いと
+>   初回は数十分かかる（進捗は `tail -f logs/mori-cron.log`）
+> - LaunchAgent は **GUI ログインセッションが必要**。ログインしっぱなしにしない Mac mini 等の
+>   常時稼働サーバーでは、launchd ではなく下記の cron を使う
 
-登録できたか必ず検証する:
+**実際に取得まで成功したこと**の確認（登録成功≠実行成功。`catchup start` は開始しか意味しない）:
 
 ```bash
-plutil -lint ~/Library/LaunchAgents/com.iloli.mori-kikori.plist          # 構文OKか
-# plist が指すスクリプトが実在するか（置換ミスならここで NG になる）
-test -x "$(plutil -extract ProgramArguments.1 raw ~/Library/LaunchAgents/com.iloli.mori-kikori.plist)" \
-  && echo "path OK" || echo "path NG: 置換をやり直す"
-launchctl print gui/$(id -u)/com.iloli.mori-kikori | head -5             # 登録されているか
+cat logs/.last-success-date        # 今日の日付になっていれば当日実行まで完了
+tail -3 logs/mori-cron.log         # 「END (exit=0)」で終わっていれば取得成功
 ```
 
-**実際に動いたこと**まで確認する（登録成功≠実行成功）:
+手動で発火させたい場合は `launchctl kickstart gui/$(id -u)/com.iloli.mori-kikori` のあと上記2つで確認する
+（本日成功済みなら `logs/mori-catchup.log` に `already succeeded today — skip` が増える）。
 
-```bash
-launchctl kickstart gui/$(id -u)/com.iloli.mori-kikori
-sleep 5; tail -3 logs/mori-catchup.log
-# 「catchup start」（実行開始）か「already succeeded today — skip」（本日成功済み）が
-# 出ていれば launchd 経由の起動は正常。何も増えなければ logs/mori-launchd.log を見る
-```
-
-plist を修正して再登録するときは、いったん解除してから登録し直す:
-
-```bash
-launchctl bootout gui/$(id -u)/com.iloli.mori-kikori   # 解除（未登録なら「No such process」で無害）
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iloli.mori-kikori.plist
-```
+解除は `launchctl bootout gui/$(id -u)/com.iloli.mori-kikori`。
+手動で plist を配置したい場合は `com.iloli.mori-kikori.plist.example` のコメントを参照
+（`/path/to/mori-kikori` の置換に sed を使う場合、パスに `&` や `|` が含まれると壊れる点に注意。
+インストーラは python 置換なのでこの問題がない）。
 
 ### Linux 等: cron
 
@@ -198,6 +189,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.iloli.mori-kikori.pl
 - **30 日を超えて止まっていた場合**: 再ログイン後、デフォルトのバックフィルは過去 30 日分しか
   見ないため、それより前の欠落日は `--days-back 90` や `--start-date 2026-06-01` のように
   範囲を広げて一度手動実行すれば回収できる
+- **8 日以上遅れて文字起こしが確定した場合**: 自動再取得の窓（直近 8 日）を過ぎた日は
+  空マークのままになる。気づいたら `--date YYYY-MM-DD` で個別に再取得すれば取り込める
+  （既存の実データをより小さい内容で上書きすることはない）
 - **launchd に登録したのに何も起きない**: 上記「動作確認」の順に確認。`launchctl print` で
   登録が見えない場合は bootstrap をやり直す。`logs/mori-launchd.log` に traceback がある場合は
   venv 未作成や Python バージョン（3.11 未満）を疑う

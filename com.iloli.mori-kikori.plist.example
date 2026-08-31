@@ -2,11 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   macOS launchd template.
-  README「macOS: launchd（推奨）」の手順どおり、リポジトリ直下で sed により
-  /path/to/mori-kikori を clone 先の絶対パスへ置換して
-  ~/Library/LaunchAgents/com.iloli.mori-kikori.plist に配置し、
-  launchctl bootstrap で登録する。配置後は必ず README の検証手順
-  (plutil -lint / launchctl print) で登録状態を確認すること。
+  通常は ./install_launchd.sh が /path/to/mori-kikori を clone 先の絶対パスへ
+  置換して ~/Library/LaunchAgents/ に配置・登録・検証まで行う。
+  手動で置換する場合はパスに & や | が含まれると sed が壊れる点に注意し、
+  配置後に plutil -lint と launchctl print で必ず検証すること。
 -->
 <plist version="1.0">
 <dict>

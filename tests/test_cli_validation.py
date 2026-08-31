@@ -104,6 +104,19 @@ class TestRangeValidation:
         assert isinstance(today, _date)
 
 
+class TestArgparseErrorExitCode:
+    def test_invalid_int_value_exits_1_not_2(self, capsys):
+        # argparse デフォルトのエラー exit 2 は「全取得成功でデータなし」の
+        # 契約値と衝突するため、引数エラーは exit 1 に統一する
+        code, err = run_main(["--days-ago", "foo"], capsys)
+        assert code == 1
+        assert "エラー" in err
+
+    def test_unknown_option_exits_1(self, capsys):
+        code, err = run_main(["--no-such-option"], capsys)
+        assert code == 1
+
+
 class TestLoginHint:
     def test_login_hint_uses_venv_python(self):
         # 認証失効メッセージをそのままコピペして実行できること

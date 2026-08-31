@@ -6,15 +6,17 @@ MCP クライアントとして直接呼び出す。認証は OAuth 2.1（初回
 mcp SDK はトークン有効期限をプロセス内にしか保持せず、再起動後に期限切れ
 アクセストークンを送って 401 → フル再認可に落ちるため、SDK 任せにしない）。
 
-使い方:
-    python mori_fetch.py --login          # 初回認証（ブラウザが開く）
-    python mori_fetch.py --list-tools     # MCP ツール一覧とスキーマを表示
-    python mori_fetch.py --date 2026-08-21
-    python mori_fetch.py --days-ago 1     # 前日分（cron 用）
-    python mori_fetch.py                  # 未取得日を自動バックフィル
+使い方（リポジトリ直下で実行）:
+    .venv/bin/python mori_fetch.py --login          # 初回認証（ブラウザが開く）
+    .venv/bin/python mori_fetch.py --list-tools     # MCP ツール一覧とスキーマを表示
+    .venv/bin/python mori_fetch.py --date 2026-08-21
+    .venv/bin/python mori_fetch.py --days-ago 1     # 前日分のみ
+    .venv/bin/python mori_fetch.py                  # 未取得日を自動バックフィル
 
-終了コード（limitless_fetch.py と同じ規約）:
-    0 = データあり保存成功 / 1 = API・認証エラー / 2 = データなし（空ファイルでスキップマーク）
+終了コード:
+    単日実行:     0 = データあり保存成功 / 1 = エラー / 2 = データなし（空ファイルでスキップマーク）
+    バックフィル: 0 = 全日付処理完了（データなし日は成功扱い）/ 1 = 1日以上失敗
+    引数エラーは常に 1（2 は「データなし」の契約値のため使わない）
 
 ※ 空ファイルのスキップマークは「全取得が成功してデータが無かった」場合のみ作る
    （セッション0件、または全セッションの本文が正当に空）。通信エラー等の異常は
@@ -421,9 +423,10 @@ async def list_sessions_for_date(client: MoriClient, target_day: date) -> list[d
         await asyncio.sleep(LIST_PAGE_INTERVAL_SEC)
 
     selected = [s for s in sessions if _session_date(s) in (target_day, None)]
-    # ISO文字列の辞書順はオフセット混在(+09:00とZ等)で狂うため、パース済み時刻で並べる
+    # ISO文字列の辞書順はオフセット混在(+09:00とZ等)で狂うため、パース済み時刻で並べる。
+    # 日付判定(_session_date)と同じく start_time 別名にもフォールバックする
     epoch = datetime.fromtimestamp(0, tz=timezone.utc)
-    selected.sort(key=lambda s: _parse_iso(s.get("started_at")) or epoch)
+    selected.sort(key=lambda s: _parse_iso(s.get("started_at") or s.get("start_time")) or epoch)
     return selected
 
 
@@ -626,8 +629,17 @@ def _refresh_or_exit() -> None:
         sys.exit(1)
 
 
+class _Parser(argparse.ArgumentParser):
+    """引数エラーを exit 1 にする（argparse 既定の 2 は「データなし」契約値と衝突するため）。"""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        print(f"エラー: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         description="Mori MCP から会話トランスクリプトを取得（引数なしで過去30日の未取得日を自動バックフィル）"
     )
     parser.add_argument("--login", action="store_true", help="初回 OAuth 認証（ブラウザが開く）")
@@ -678,9 +690,25 @@ def main() -> None:
         sys.exit(1)
 
     if args.login:
-        sys.exit(asyncio.run(do_login()))
+        try:
+            sys.exit(asyncio.run(do_login()))
+        except AuthRequiredError as e:
+            print(f"認証エラー: {e}", file=sys.stderr)
+            sys.exit(1)
+        except OSError as e:
+            print(
+                f"エラー: 認証コールバックサーバーを起動できません ({e})。\n"
+                f"ポート {CALLBACK_PORT} を使用中のプロセスがないか `lsof -i :{CALLBACK_PORT}` で確認し、"
+                "再度 --login を実行してください。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     if args.list_tools:
-        sys.exit(asyncio.run(do_list_tools()))
+        try:
+            sys.exit(asyncio.run(do_list_tools()))
+        except AuthRequiredError as e:
+            print(f"認証エラー: {e}", file=sys.stderr)
+            sys.exit(1)
 
     os.makedirs(DATA_DIR, exist_ok=True)
     today = _today_jst()

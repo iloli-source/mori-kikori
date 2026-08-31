@@ -20,8 +20,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs"
 LOG_FILE="$LOG_DIR/mori-catchup.log"
 STAMP_FILE="$LOG_DIR/.last-success-date"
+FAIL_COUNT_FILE="$LOG_DIR/.consecutive-failures"
+NOTIFY_AFTER_FAILURES=3
 
 mkdir -p "$LOG_DIR"
+
+# 簡易ローテーション: 毎時のスキップ行で肥大しないよう、512KB を超えたら直近500行だけ残す
+if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 524288 ]; then
+  tail -500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+fi
+
+notify() {
+  # macOS のみデスクトップ通知（osascript が無い環境では黙ってスキップ）
+  command -v osascript >/dev/null 2>&1 || return 0
+  osascript -e "display notification \"$1\" with title \"mori-kikori\"" 2>/dev/null || true
+}
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
@@ -84,13 +97,19 @@ EXIT_CODE=$?
 
 if [ "$EXIT_CODE" -eq 0 ]; then
   echo "$TODAY" > "$STAMP_FILE"
+  rm -f "$FAIL_COUNT_FILE"
   log "=== catchup success — stamped $TODAY ==="
 else
-  log "=== catchup failed (exit=$EXIT_CODE) — will retry on next launchd fire ==="
-  # 認証失効はユーザー操作(--login)がないと永久に直らないため、ログに埋もれさせず
-  # macOS のデスクトップ通知で知らせる（osascript がない環境では黙ってスキップ）
-  if tail -30 "$LOG_DIR/mori-cron.log" 2>/dev/null | grep -q "認証が失効" && command -v osascript >/dev/null 2>&1; then
-    osascript -e 'display notification "mori の認証が失効しています。リポジトリ直下で .venv/bin/python mori_fetch.py --login を実行してください。" with title "mori-kikori"' 2>/dev/null || true
+  FAILS=$(( $(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+  echo "$FAILS" > "$FAIL_COUNT_FILE"
+  log "=== catchup failed (exit=$EXIT_CODE, consecutive=$FAILS) — will retry on next launchd fire ==="
+  # 認証失効はユーザー操作(--login)がないと永久に直らないため即通知。
+  # それ以外の原因（API変更・ネットワーク等）も、連続 N 回失敗したら通知して
+  # サイレント停止を防ぐ。
+  if tail -30 "$LOG_DIR/mori-cron.log" 2>/dev/null | grep -q "認証が失効"; then
+    notify "mori の認証が失効しています。リポジトリ直下で .venv/bin/python mori_fetch.py --login を実行してください。"
+  elif [ "$FAILS" -ge "$NOTIFY_AFTER_FAILURES" ]; then
+    notify "mori の取得が ${FAILS} 回連続で失敗しています。logs/mori-cron.log を確認してください。"
   fi
 fi
 
