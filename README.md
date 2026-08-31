@@ -18,6 +18,19 @@ mori には公開 REST API がない（API キー・PAT・webhook は「将来�
 - アクセストークン 1 時間 / リフレッシュトークン 30 日。**毎回の実行冒頭で自前でリフレッシュしてから接続する**（mcp SDK はトークン有効期限をプロセス内にしか保持せず、再起動後に期限切れトークンを送ってしまうため）。リフレッシュ成功のたびに 30 日延命されるので、cron が 30 日以内に一度でも動いていれば再ログイン不要
 - Mori MCP は読み取り専用（レコードの追加・編集・削除は不可能）
 
+## mori MCP の仕様（実測メモ）
+
+公式ドキュメントが乏しいため、`--list-tools` と実運用で確認した仕様を記す（2026-08 時点。予告なく変わる可能性あり）。
+
+- **エンドポイント**: `https://mcp.mori.to`（Streamable HTTP）。トークンエンドポイントは `https://mcp.mori.to/oauth/token`
+- **認証**: OAuth 2.1（PKCE + 動的クライアント登録）。スコープは `mori.sessions:read mori.transcripts:read`。アクセストークン 1 時間 / リフレッシュトークン 30 日（リフレッシュ成功で 30 日延命）
+- **提供ツール**: `search` / `fetch` / `list_sessions` / `list_journals`（すべて読み取り専用）
+- **`list_sessions`**: 引数 `{from, to, limit, offset}`。`limit` は最大 50。ページネーションは `offset` で行う
+- **`fetch`**: 引数 `{uri: "mori://transcript/session/<id>"}`。セッション ID `mori://session/<id>` の `session/` を `transcript/session/` に読み替えると transcript URI になる。レスポンスは `object.transcript.utterances[]` に発話が一括で入り、各発話は `{started_at, text, speaker_name?}`（`start_time` / `speaker` という別名で返るケースもある）
+- **レート制限**: transcript fetch は約 10 回/分。本ツールはセッション間 7 秒・list ページ間 1 秒・バックフィル日次間 7 秒待機して回避している
+- **文字起こしの遅延**: 録音がサーバー側で文字起こしされるまで**最大 7 日程度遅れる**ことがある。当日〜数日前の取得結果は不完全な可能性があるため、日次運用では `--refetch-recent 8` で直近分を再取得し続ける
+- **公開 REST API / API キー / webhook**: 現時点では提供なし（「将来対応予定」のアナウンスのみ）
+
 ## セットアップ
 
 ```bash
@@ -31,11 +44,23 @@ python3 -m venv .venv
 ## 使い方
 
 ```bash
-.venv/bin/python mori_fetch.py --days-ago 1        # 前日分のみ（単発実行用）
-.venv/bin/python mori_fetch.py --date 2026-08-21   # 指定日
 .venv/bin/python mori_fetch.py                     # 未取得日を自動バックフィル（過去30日〜昨日）
+.venv/bin/python mori_fetch.py --date 2026-08-21   # 指定日のみ
+.venv/bin/python mori_fetch.py --days-ago 1        # 前日分のみ（0=今日, 1=昨日）
+.venv/bin/python mori_fetch.py --refetch-recent 8  # バックフィル + 直近8日は取得済みでも再取得
 .venv/bin/python mori_fetch.py --list-tools        # MCP ツールスキーマ表示（デバッグ用）
 ```
+
+| オプション | 説明 |
+|---|---|
+| （引数なし） | バックフィルモード。過去 `--days-back` 日（デフォルト 30）〜昨日のうち未取得日を古い順に取得 |
+| `--date YYYY-MM-DD` | 指定日のみ取得 |
+| `--days-ago N` | N 日前のみ取得（`0`=今日, `1`=昨日） |
+| `--start-date` / `--end-date` | バックフィル範囲を明示指定（`--end-date` デフォルトは昨日） |
+| `--days-back N` | バックフィル対象の過去日数（デフォルト 30） |
+| `--refetch-recent N` | バックフィル後、直近 N 日を取得済みでも再取得して上書き（文字起こし遅延の取り込み用。日次運用では `8` を推奨） |
+| `--login` | 初回 OAuth 認証（ブラウザが開く） |
+| `--list-tools` | MCP ツール一覧とスキーマを表示 |
 
 日付は常に **Asia/Tokyo** 基準（ホスト OS のタイムゾーンに依存しない）。
 バックフィルは当日を対象にしない（その日の記録がまだ確定していないため）。
