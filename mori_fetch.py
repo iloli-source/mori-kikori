@@ -499,6 +499,8 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
                     # 取れなかったデータを「処理済み」として隠蔽するため失敗にする
                     raise RuntimeError(f"session without id: {session.get('title')!r}")
                 title = session.get("title") or ""
+                # レート制限の7秒待機で数分かかる日もあるため、無出力に見えないよう進捗を出す
+                print(f"  セッション {i + 1}/{len(sessions)} を取得中...")
                 transcript = await fetch_transcript(client, session)
                 text = transcript_to_text(transcript, title=title)
                 if text.strip():
@@ -618,15 +620,23 @@ async def do_list_tools() -> int:
 
 
 def _refresh_or_exit() -> None:
-    """実行冒頭のトークン更新。失敗したら明確なメッセージで終了コード1。"""
-    try:
-        asyncio.run(ensure_fresh_token())
-    except AuthRequiredError as e:
-        print(f"認証エラー: {e}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"トークン更新エラー: {type(e).__name__}: {e}", file=sys.stderr)
-        sys.exit(1)
+    """実行冒頭のトークン更新。認証失効は即終了、一時障害は1回だけ再試行する。"""
+    for attempt in (1, 2):
+        try:
+            asyncio.run(ensure_fresh_token())
+            return
+        except AuthRequiredError as e:
+            print(f"認証エラー: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            if attempt == 2:
+                print(f"トークン更新エラー: {type(e).__name__}: {e}", file=sys.stderr)
+                sys.exit(1)
+            print(
+                f"トークン更新に失敗 ({type(e).__name__})。{TRANSIENT_RETRY_WAIT_SEC}秒後に再試行します...",
+                file=sys.stderr,
+            )
+            time.sleep(TRANSIENT_RETRY_WAIT_SEC)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -687,6 +697,9 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    if args.start_date is not None and args.days_back is not None:
+        print("エラー: --start-date と --days-back は併用できません（--days-back が無視されるため）。", file=sys.stderr)
+        sys.exit(1)
     if args.days_back is not None and args.days_back < 1:
         print("エラー: --days-back は 1 以上を指定してください。", file=sys.stderr)
         sys.exit(1)
@@ -718,7 +731,7 @@ def main() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     today = _today_jst()
 
-    if args.date:
+    if args.date is not None:
         try:
             target = date.fromisoformat(args.date)
         except ValueError:
@@ -738,8 +751,8 @@ def main() -> None:
     # デフォルト: 未取得日の自動バックフィル（当日は対象外 — 記録が確定していないため）
     days_back = args.days_back if args.days_back is not None else 30
     try:
-        start = date.fromisoformat(args.start_date) if args.start_date else today - timedelta(days=days_back)
-        end = date.fromisoformat(args.end_date) if args.end_date else today - timedelta(days=1)
+        start = date.fromisoformat(args.start_date) if args.start_date is not None else today - timedelta(days=days_back)
+        end = date.fromisoformat(args.end_date) if args.end_date is not None else today - timedelta(days=1)
     except ValueError:
         print("エラー: 日付は YYYY-MM-DD 形式で指定してください。", file=sys.stderr)
         sys.exit(1)

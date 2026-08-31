@@ -42,6 +42,11 @@ fi
 # 所有者(自分のPIDが記録されている)場合のみロックを片付ける — 競合側のロックを消さない
 trap '[ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK_DIR"' EXIT
 
+# 簡易ローテーション: 2MB を超えたら直近2000行だけ残す（ロック取得後なので競合しない）
+if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 2097152 ]; then
+  tail -2000 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+fi
+
 {
   echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (backfill --refetch-recent 8) ==="
   "$PYTHON_BIN" "$PY_SCRIPT" --refetch-recent 8

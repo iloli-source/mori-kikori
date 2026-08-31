@@ -80,6 +80,14 @@ class TestRangeValidation:
         assert code == 1
         assert "エラー" in err
 
+    def test_start_date_with_days_back_conflict(self, capsys):
+        # --start-date 指定時に --days-back が黙って無視される偽成功を防ぐ
+        code, err = run_main(
+            ["--start-date", "2026-08-01", "--days-back", "60"], capsys
+        )
+        assert code == 1
+        assert "併用できません" in err
+
     def test_days_back_zero_errors(self, capsys):
         code, err = run_main(["--days-back", "0"], capsys)
         assert code == 1
@@ -102,6 +110,19 @@ class TestRangeValidation:
         assert code == 1
         assert "エラー" in err
         assert isinstance(today, _date)
+
+
+class TestEmptyStringDates:
+    def test_empty_date_errors_instead_of_silent_backfill(self, capsys):
+        # `--date ""` が falsy 判定でバックフィルに落ちる事故を防ぐ
+        code, err = run_main(["--date", ""], capsys)
+        assert code == 1
+        assert "エラー" in err
+
+    def test_empty_start_date_errors(self, capsys):
+        code, err = run_main(["--start-date", ""], capsys)
+        assert code == 1
+        assert "エラー" in err
 
 
 class TestArgparseErrorExitCode:

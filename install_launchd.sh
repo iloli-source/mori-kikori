@@ -21,7 +21,7 @@ fi
 
 mkdir -p "$HOME/Library/LaunchAgents" "$SCRIPT_DIR/logs"
 
-REPO_DIR="$SCRIPT_DIR" DEST="$PLIST_DEST" python3 - <<'EOF'
+REPO_DIR="$SCRIPT_DIR" DEST="$PLIST_DEST" "$SCRIPT_DIR/.venv/bin/python3" - <<'EOF'
 import os
 from xml.sax.saxutils import escape
 
