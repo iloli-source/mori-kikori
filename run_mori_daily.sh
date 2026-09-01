@@ -47,9 +47,13 @@ if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 2097152 ]; then
   tail -2000 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
 fi
 
+# 直近何日を取得済みでも再取得するか。mori の文字起こし遅延(公称最大7日)+1日が既定。
+# 遅延がそれ以上になる環境では MORI_REFETCH_DAYS=14 のように上書きできる。
+REFETCH_DAYS="${MORI_REFETCH_DAYS:-8}"
+
 {
-  echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (backfill --refetch-recent 8) ==="
-  "$PYTHON_BIN" "$PY_SCRIPT" --refetch-recent 8
+  echo "=== $(date '+%Y-%m-%d %H:%M:%S') START (backfill --refetch-recent $REFETCH_DAYS) ==="
+  "$PYTHON_BIN" "$PY_SCRIPT" --refetch-recent "$REFETCH_DAYS"
   EXIT_CODE=$?
   echo "=== $(date '+%Y-%m-%d %H:%M:%S') END (exit=$EXIT_CODE) ==="
   echo ""

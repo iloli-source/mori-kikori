@@ -111,6 +111,10 @@ else
   # 認証失効はユーザー操作(--login)がないと永久に直らないため即通知。
   # それ以外の原因（API変更・ネットワーク等）も、連続 N 回失敗したら通知して
   # サイレント停止を防ぐ。
+  # daily.sh 側のログローテーションで行数が減っていたらオフセットを先頭に戻す
+  # （過大オフセットで空を読み、失効通知を空振りさせないため）
+  CUR_LINES="$(wc -l < "$CRON_LOG" 2>/dev/null || echo 0)"
+  [ "$CUR_LINES" -lt "$CRON_LOG_START" ] && CRON_LOG_START=0
   if tail -n +$((CRON_LOG_START + 1)) "$CRON_LOG" 2>/dev/null | grep -q "認証が失効"; then
     notify "mori の認証が失効しています。リポジトリ直下で .venv/bin/python mori_fetch.py --login を実行してください。"
   elif [ "$FAILS" -ge "$NOTIFY_AFTER_FAILURES" ]; then
