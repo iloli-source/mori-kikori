@@ -192,7 +192,9 @@ tail -3 logs/mori-cron.log         # 「END (exit=0)」で終わっていれば�
 - **8 日以上遅れて文字起こしが確定した場合**: 自動再取得の窓（既定は直近 8 日 = 公称最大遅延
   7 日 + 1 日）を過ぎた日は空マークのままになる。気づいたら `--date YYYY-MM-DD` で個別に
   再取得すれば取り込める（既存の実データをより小さい内容で上書きすることはない）。
-  遅延が常態的に長い場合は環境変数 `MORI_REFETCH_DAYS=14` のように窓自体を広げられる
+  遅延が常態的に長い場合は `MORI_REFETCH_DAYS=14` のように窓自体を広げられる
+  （cron なら crontab の行頭に環境変数として記述。launchd はシェルの export を引き継がないため、
+  plist の `EnvironmentVariables` に `MORI_REFETCH_DAYS` を追記して `./install_launchd.sh` で再登録する）
 - **launchd に登録したのに何も起きない**: 上記「動作確認」の順に確認。`launchctl print` で
   登録が見えない場合は `./install_launchd.sh` をやり直す。Python の traceback や
   venv 未作成のエラーは `logs/mori-cron.log` に出る（`logs/mori-launchd.log` は
