@@ -9,6 +9,7 @@ import time
 
 import httpx2
 import pytest
+from mcp.shared.auth import OAuthToken
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -137,3 +138,30 @@ class TestSchemaInvalidTokens:
 
         assert result is None
         assert (tmp_path / "tokens.json.corrupt").exists()
+
+
+class TestTokenPersistenceIsDurable:
+    """サーバーがリフレッシュトークンを回転させた後は、新しいトークンが失われると再ログインが必要になる。
+    保存はディスクへ同期してから置換し、電源断で空や旧内容に戻る窓を最小にする（formal/TokenRefresh.tla）。"""
+
+    def test_save_syncs_file_before_replacing(self, tmp_path, monkeypatch):
+        storage = _seed_storage(tmp_path)
+        events: list[str] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def spy_fsync(fd):
+            events.append("fsync")
+            return real_fsync(fd)
+
+        def spy_replace(src, dst):
+            events.append("replace")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "fsync", spy_fsync)
+        monkeypatch.setattr(os, "replace", spy_replace)
+
+        asyncio.run(storage.set_tokens(OAuthToken.model_validate({**OLD_TOKENS, "refresh_token": "rotated"})))
+
+        assert events[:2] == ["fsync", "replace"]
+        assert events.count("fsync") >= 2  # ファイル本体と、置換後のディレクトリ
+        assert json.loads((tmp_path / "tokens.json").read_text())["tokens"]["refresh_token"] == "rotated"
