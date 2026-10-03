@@ -9,3 +9,6 @@ __pycache__/
 .DS_Store
 .run-lock/
 .catchup-lock/
+.run.lock
+.catchup.lock
+formal/states/

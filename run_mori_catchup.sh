@@ -10,8 +10,10 @@
 # 設計:
 # - スタンプ logs/.last-success-date に最終成功日(JST)を記録。今日と一致なら即スキップ。
 # - 実行が exit 0 のときだけスタンプを書く。失敗日はスタンプが残らず次の発火で再試行。
+# - exit 75 は「別プロセスが実行中で何もしなかった」。成功でも失敗でもないので
+#   スタンプも失敗カウントも触らず、次の発火に任せる（formal/CatchupStamp.tla）。
 # - 取りこぼし日の回収は run_mori_daily.sh のバックフィルモード(--refetch-recent 8)が担う。
-# - 多重起動防止は run_mori_daily.sh 内の mkdir ロックに委譲する。
+# - 多重起動防止は flock(2)（runlock.py）。本処理のロックは run_mori_daily.sh が取る。
 
 set -u
 export TZ=Asia/Tokyo
@@ -22,6 +24,12 @@ LOG_FILE="$LOG_DIR/mori-catchup.log"
 STAMP_FILE="$LOG_DIR/.last-success-date"
 FAIL_COUNT_FILE="$LOG_DIR/.consecutive-failures"
 NOTIFY_AFTER_FAILURES=3
+PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python3"
+# daily.sh が「別プロセス実行中で何もしなかった」ことを示す終了コード（daily.sh の SKIP_EXIT と一致させる）
+SKIP_EXIT=75
+# テストから差し替えられるように（既定は同じディレクトリの run_mori_daily.sh / .catchup.lock）
+DAILY_SCRIPT="${MORI_DAILY_SCRIPT:-$SCRIPT_DIR/run_mori_daily.sh}"
+CATCHUP_LOCK_FILE="${MORI_CATCHUP_LOCK_FILE:-$SCRIPT_DIR/.catchup.lock}"
 
 mkdir -p "$LOG_DIR"
 
@@ -35,6 +43,12 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
 }
 
+# 連続失敗カウンタを1つ進める（FAILS に現在の連続回数を残す）
+count_failure() {
+  FAILS=$(( $(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+  echo "$FAILS" > "$FAIL_COUNT_FILE"
+}
+
 TODAY="$(date '+%F')"
 LAST_SUCCESS="$(cat "$STAMP_FILE" 2>/dev/null || true)"
 
@@ -46,33 +60,27 @@ if [ "$LAST_SUCCESS" = "$TODAY" ]; then
 fi
 
 # catchup 同士の多重起動を防止（launchd の RunAtLoad と StartInterval が
-# ほぼ同時に発火し得る）。これがないと「片方が daily.sh のロックに弾かれて
-# exit 0 → 実処理していないのに成功スタンプを書く」レースの入口になる。
-# daily.sh と同じく PID 生存確認付き: kill -9 や再起動でロックが残っても
-# 永久スキップに陥らず自動回収する。
-CATCHUP_LOCK="$SCRIPT_DIR/.catchup-lock"
-CATCHUP_PID_FILE="$CATCHUP_LOCK/pid"
-if ! mkdir "$CATCHUP_LOCK" 2>/dev/null; then
-  OTHER_PID="$(cat "$CATCHUP_PID_FILE" 2>/dev/null || true)"
-  if [ -n "$OTHER_PID" ] && ps -o command= -p "$OTHER_PID" 2>/dev/null | grep -q 'run_mori_catchup\.sh'; then
-    log "another catchup in progress (pid=$OTHER_PID) — skip"
-    exit 0
-  fi
-  # 残骸ロック（プロセス消滅 or 無関係プロセスの PID）を回収
-  rm -rf "$CATCHUP_LOCK"
-  if ! mkdir "$CATCHUP_LOCK" 2>/dev/null; then
-    log "catchup lock busy — skip"
-    exit 0
-  fi
+# ほぼ同時に発火し得る）。ログのローテーションと失敗カウンタの読み書きを直列化する。
+# daily.sh と同じ flock 方式: kill -9 や再起動でも OS がロックを解放するので、
+# 残骸回収が不要で永久スキップにも陥らない。
+if ! exec 8>>"$CATCHUP_LOCK_FILE"; then
+  log "cannot open catchup lock file $CATCHUP_LOCK_FILE"
+  exit 1
 fi
-echo $$ > "$CATCHUP_PID_FILE"
-# 残骸回収の同時競合(TOCTOU)対策: 書いた直後に自分の PID が残っているか再確認
-if [ "$(cat "$CATCHUP_PID_FILE" 2>/dev/null)" != "$$" ]; then
-  log "catchup lock lost to concurrent reclaim — skip"
+"$PYTHON_BIN" "$SCRIPT_DIR/runlock.py" 8
+LOCK_RC=$?
+if [ "$LOCK_RC" -eq "$SKIP_EXIT" ]; then
+  log "another catchup in progress — skip"
   exit 0
+elif [ "$LOCK_RC" -ne 0 ]; then
+  # ロック確認自体ができない（.venv が壊れている等）。黙って止まらないよう失敗として数える
+  count_failure
+  log "=== cannot take catchup lock (rc=$LOCK_RC, consecutive=$FAILS) ==="
+  if [ "$FAILS" -ge "$NOTIFY_AFTER_FAILURES" ]; then
+    notify "mori の取得が ${FAILS} 回連続で失敗しています。logs/mori-catchup.log を確認してください。"
+  fi
+  exit 1
 fi
-# 所有者の場合のみロックを片付ける — 競合側のロックを消さない
-trap '[ "$(cat "$CATCHUP_PID_FILE" 2>/dev/null)" = "$$" ] && rm -rf "$CATCHUP_LOCK"' EXIT
 
 # 簡易ローテーション: 毎時のスキップ行で肥大しないよう、512KB を超えたら直近500行だけ残す。
 # ロック取得後に行うことで、同時起動とのローテーション競合によるログ喪失を防ぐ。
@@ -80,33 +88,27 @@ if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 524288 ]; then
   tail -500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
 fi
 
-# run_mori_daily.sh は「別プロセス実行中でスキップ」時も exit 0 を返すため、
-# その場合に成功スタンプを書いてしまわないよう、先行実行中なら何もせず抜ける。
-# （手動実行との一瞬のレースは残るが、誤スタンプしても翌日のバックフィル
-#  --refetch-recent 8 が同じ日を再取得するためデータは欠損しない）
-if [ -d "$SCRIPT_DIR/.run-lock" ]; then
-  OTHER_PID="$(cat "$SCRIPT_DIR/.run-lock/pid" 2>/dev/null || true)"
-  if [ -n "$OTHER_PID" ] && ps -o command= -p "$OTHER_PID" 2>/dev/null | grep -q 'run_mori_daily\.sh'; then
-    log "another run in progress (pid=$OTHER_PID) — skip without stamping"
-    exit 0
-  fi
-fi
-
 log "=== catchup start (last_success=${LAST_SUCCESS:-none}) ==="
 # 今回の実行で新しく書かれた本体ログだけを失敗原因の判定に使う
 # （過去の認証エラー行に反応して誤通知しないため）
 CRON_LOG="$LOG_DIR/mori-cron.log"
 CRON_LOG_START="$(wc -l < "$CRON_LOG" 2>/dev/null || echo 0)"
-/bin/bash "$SCRIPT_DIR/run_mori_daily.sh"
+/bin/bash "$DAILY_SCRIPT"
 EXIT_CODE=$?
+
+if [ "$EXIT_CODE" -eq "$SKIP_EXIT" ]; then
+  # 別プロセス（手動実行など）が本処理中。成功でも失敗でもないのでスタンプも失敗カウントも
+  # 触らず、次の発火に任せる。ここでスタンプすると、その実行が失敗しても当日は再試行されない
+  log "=== daily skipped (another run in progress) — not stamping, not counted as failure ==="
+  exit 0
+fi
 
 if [ "$EXIT_CODE" -eq 0 ]; then
   echo "$TODAY" > "$STAMP_FILE"
   rm -f "$FAIL_COUNT_FILE"
   log "=== catchup success — stamped $TODAY ==="
 else
-  FAILS=$(( $(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
-  echo "$FAILS" > "$FAIL_COUNT_FILE"
+  count_failure
   log "=== catchup failed (exit=$EXIT_CODE, consecutive=$FAILS) — will retry on next launchd fire ==="
   # 認証失効はユーザー操作(--login)がないと永久に直らないため即通知。
   # それ以外の原因（API変更・ネットワーク等）も、連続 N 回失敗したら通知して

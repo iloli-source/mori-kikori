@@ -17,6 +17,7 @@ mcp SDK はトークン有効期限をプロセス内にしか保持せず、再
     単日実行:     0 = データあり保存成功 / 1 = エラー / 2 = データなし（空ファイルでスキップマーク）
     バックフィル: 0 = 全日付処理完了（データなし日は成功扱い）/ 1 = 1日以上失敗
     引数エラーは常に 1（2 は「データなし」の契約値のため使わない）
+    75 = 別のプロセス（日次実行や手動実行）が実行中のため何もしなかった（成功でも失敗でもない）
 
 ※ 空ファイルのスキップマークは「全取得が成功してデータが無かった」場合のみ作る
    （セッション0件、または全セッションの本文が正当に空）。通信エラー等の異常は
@@ -42,6 +43,7 @@ from mcp.client.auth import OAuthClientProvider
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata, OAuthToken
 
+import runlock
 from auth_store import TOKENS_FILE, FileTokenStorage
 
 MCP_URL = "https://mcp.mori.to"
@@ -707,6 +709,21 @@ def main() -> None:
         print("エラー: --refetch-recent は 0 以上を指定してください。", file=sys.stderr)
         sys.exit(1)
 
+    # ここから先はトークンと data/ を読み書きする。日次実行・他の手動実行と同じロックで直列化する
+    # （同じリフレッシュトークンを2プロセスが送ると片方が invalid_grant になる: formal/TokenRefresh.tla）
+    try:
+        with runlock.held():
+            _run(args)
+    except runlock.RunLockBusy:
+        print(
+            "別の mori_fetch / run_mori_daily.sh が実行中のため、何もせず終了します。終わってから再実行してください。",
+            file=sys.stderr,
+        )
+        sys.exit(runlock.SKIP_EXIT)
+
+
+def _run(args: argparse.Namespace) -> None:
+    """引数検証済みの本処理（実行ロック保持中に呼ばれる）。"""
     if args.login:
         try:
             sys.exit(asyncio.run(do_login()))
