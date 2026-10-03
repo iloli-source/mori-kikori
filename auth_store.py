@@ -51,10 +51,28 @@ class FileTokenStorage:
             fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+                # 回転後のリフレッシュトークンは失うと再ログインが必要になる。置換の前に
+                # ディスクへ同期し、電源断で空ファイルや旧内容に戻る窓を最小にする
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, self.path)
+            self._sync_dir()
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+
+    def _sync_dir(self) -> None:
+        """rename をディスクへ確定させる（対応していないファイルシステムでは何もしない）。"""
+        try:
+            fd = os.open(os.path.dirname(os.path.abspath(self.path)), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
     async def get_tokens(self) -> OAuthToken | None:
         """保存済みトークンを返す。expires_in は取得時刻からの残り秒数に補正する。
