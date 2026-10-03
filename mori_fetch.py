@@ -470,6 +470,14 @@ def _atomic_write(path: str, content: str) -> None:
             os.unlink(tmp_path)
 
 
+def _mark_verified(path: str) -> None:
+    """内容を書き換えずに保持した場合も「いま取得して確認した」ことを更新時刻に残す。
+
+    更新時刻は find_unsettled_dates が「最後に取得した日」として使う。
+    """
+    os.utime(path, None)
+
+
 async def download_single_date(target_day: date, data_dir: str) -> int:
     """指定日の全セッションの Transcript を取得して1ファイルに保存する。
 
@@ -490,6 +498,7 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                     # 再取得で0件になっても、既存の実データを空マークで潰さない
                     print(f"  → {target_day}: サーバーは0件だが既存データがあるため保持します。", file=sys.stderr)
+                    _mark_verified(out_path)
                     return 0
                 print(f"  → {target_day}: セッションはありませんでした。")
                 _atomic_write(out_path, "")
@@ -518,6 +527,7 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
                 # 全セッションが正当に本文空だった日として、スキップマークを作る。
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                     print(f"  → {target_day}: サーバーは本文なしだが既存データがあるため保持します。", file=sys.stderr)
+                    _mark_verified(out_path)
                     return 0
                 print(f"  → {target_day}: セッション {len(sessions)} 件、いずれも本文なし。空マークを作成します。")
                 _atomic_write(out_path, "")
@@ -531,6 +541,7 @@ async def download_single_date(target_day: date, data_dir: str) -> int:
                     f"  → {target_day}: 新規取得 {new_size}B が既存 {os.path.getsize(out_path)}B より小さいため保持します。",
                     file=sys.stderr,
                 )
+                _mark_verified(out_path)
                 return 0
 
             _atomic_write(out_path, result)
@@ -587,6 +598,28 @@ def find_missing_dates(data_dir: str, start_date: date, end_date: date) -> list[
             missing.append(current)
         current += timedelta(days=1)
     return missing
+
+
+def find_unsettled_dates(data_dir: str, start_date: date, end_date: date, settle_days: int) -> list[date]:
+    """取得済みだが、最後の取得が「対象日 + settle_days 日」より前だった日付を返す。
+
+    文字起こしは遅れて確定するため、それより前に取得したファイル（空マークを含む）は
+    まだ確定内容とは限らない。「実行日から見て直近N日」だけを再取得する方式では、
+    確定前に取得したあと N 日以上実行が成功しなかった日が二度と再取得されない
+    （formal/RefetchSettle.tla の反例）。最後に取得した日はファイルの更新時刻で判定する。
+    """
+    unsettled = []
+    current = start_date
+    while current <= end_date:
+        path = os.path.join(data_dir, f"{FILE_PREFIX}{current.isoformat()}.txt")
+        try:
+            fetched_on = datetime.fromtimestamp(os.path.getmtime(path), TIMEZONE).date()
+        except OSError:
+            fetched_on = None  # 未取得は find_missing_dates が拾う
+        if fetched_on is not None and fetched_on < current + timedelta(days=settle_days):
+            unsettled.append(current)
+        current += timedelta(days=1)
+    return unsettled
 
 
 # ---------------------------------------------------------------------------
@@ -787,11 +820,13 @@ def _run(args: argparse.Namespace) -> None:
     missing = find_missing_dates(DATA_DIR, start, end)
 
     # mori は文字起こし完了まで最大7日かかることがあるため、直近N日は
-    # 取得済みでも再取得して遅れて確定した発話を取り込む（--refetch-recent）
+    # 取得済みでも再取得して遅れて確定した発話を取り込む（--refetch-recent）。
+    # 加えて、確定前に取得したまま直近N日の窓から外れた日（長い電源断・認証失効の後など）も拾う
     refetch: list[date] = []
     if args.refetch_recent > 0:
-        refetch = [end - timedelta(days=n) for n in range(args.refetch_recent) if end - timedelta(days=n) >= start]
-        refetch = [d for d in refetch if d not in missing]
+        recent = [end - timedelta(days=n) for n in range(args.refetch_recent) if end - timedelta(days=n) >= start]
+        unsettled = find_unsettled_dates(DATA_DIR, start, end, args.refetch_recent)
+        refetch = sorted(d for d in set(recent) | set(unsettled) if d not in missing)
 
     targets = sorted(set(missing) | set(refetch))
     if not targets:
