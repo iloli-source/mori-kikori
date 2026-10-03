@@ -1,0 +1,16 @@
+{
+  "root": ".",
+  "concurrency": 2,
+  "checks": [
+    { "spec": "LockReclaim.tla", "config": "LockReclaimBugEmptyPid.cfg", "expect": { "kind": "invariant-violation", "name": "MutualExclusion" } },
+    { "spec": "LockReclaim.tla", "config": "LockReclaimBugStale.cfg", "expect": { "kind": "invariant-violation", "name": "MutualExclusion" } },
+    { "spec": "LockReclaim.tla", "config": "LockReclaimFixed.cfg", "expect": { "kind": "pass" } },
+    { "spec": "CatchupStamp.tla", "config": "CatchupStampBug.cfg", "expect": { "kind": "invariant-violation", "name": "StampImpliesSuccess" } },
+    { "spec": "CatchupStamp.tla", "config": "CatchupStampFixed.cfg", "expect": { "kind": "pass" } },
+    { "spec": "TokenRefresh.tla", "config": "TokenRefreshBugConcurrent.cfg", "expect": { "kind": "invariant-violation", "name": "NoRejectedRefresh" } },
+    { "spec": "TokenRefresh.tla", "config": "TokenRefreshResidualCrash.cfg", "expect": { "kind": "invariant-violation", "name": "FileUsableAtRest" } },
+    { "spec": "TokenRefresh.tla", "config": "TokenRefreshFixed.cfg", "expect": { "kind": "pass" } },
+    { "spec": "RefetchSettle.tla", "config": "RefetchSettleBug.cfg", "expect": { "kind": "invariant-violation", "name": "NoStaleAfterSuccess" } },
+    { "spec": "RefetchSettle.tla", "config": "RefetchSettleFixed.cfg", "expect": { "kind": "pass" } }
+  ]
+}
